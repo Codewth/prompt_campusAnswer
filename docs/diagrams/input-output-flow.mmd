@@ -1,0 +1,15 @@
+flowchart LR
+    Q[Question text] --> API[POST /api/ask]
+    API --> CAT[Category]
+    API --> RET[Retrieved policy sections]
+    CAT --> PROMPT[Selected prompt + evidence]
+    RET --> PROMPT
+    PROMPT --> MODE{Execution mode}
+    MODE -- Gemini configured --> MODEL[Gemini JSON]
+    MODE -- No key --> DEMO[Deterministic lookup]
+    MODEL --> VALIDATE[Validate schema, source, section, exact quote, answer]
+    DEMO --> VALIDATE
+    VALIDATE -->|verified| OUT[Answer with citation and confidence]
+    VALIDATE -->|not verified| GAP[Uncertainty response, no citation]
+    OUT --> UI[Chat UI]
+    GAP --> UI

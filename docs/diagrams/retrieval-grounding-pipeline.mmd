@@ -1,0 +1,17 @@
+flowchart TD
+    A[Local TXT / text PDF] --> B[Parse document and section headings]
+    B --> C[Sections tagged with document, section, title, fictional flag]
+    Q[Question] --> D[Classify supported category]
+    C --> E[Lexical retrieval]
+    D --> E
+    E --> F{Relevant sections found?}
+    F -- No --> U[Unsupported response + office contact]
+    F -- Yes --> G{Same-title conflicting sections?}
+    G -- Yes --> X[Conflict response; no selected rule]
+    G -- No --> H[Prompt / deterministic evidence response]
+    H --> I[Check document and section identity]
+    I --> J[Check exact quote is in source]
+    J --> K[Check answer is contained in verified quote]
+    K --> L{All checks pass?}
+    L -- No --> U
+    L -- Yes --> M[Supported response with source and confidence]

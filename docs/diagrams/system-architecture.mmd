@@ -1,0 +1,17 @@
+flowchart TB
+    Student[Student / local administrator] --> Browser[React + Vite + Tailwind + Lucide]
+    Browser -->|HTTP JSON / multipart| API[FastAPI + Pydantic]
+    API --> Retriever[Classification and lexical section retrieval]
+    Retriever --> Samples[sample-policies/*.txt]
+    Retriever --> Uploads[backend/documents/ local files]
+    API --> Prompt[Prompt version files]
+    Prompt --> Decision{GEMINI_API_KEY set?}
+    Decision -->|No| Demo[Deterministic demo mode]
+    Decision -->|Yes| Gemini[Gemini API + configured model]
+    Demo --> Verify[Structured response and source verification]
+    Gemini --> Verify
+    Verify --> API
+    API --> Browser
+    Tests[Pytest + JSON evaluation runner] --> Retriever
+    Tests --> Verify
+    Tests --> Results[test-data/demo-evaluation-results.json]

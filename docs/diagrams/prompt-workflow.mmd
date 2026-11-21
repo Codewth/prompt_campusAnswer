@@ -1,0 +1,16 @@
+flowchart TD
+    A[Student question] --> B[Classify: attendance / exams / fees / hostel / out of scope]
+    B --> C{In supported scope?}
+    C -- No --> D[Refuse and suggest relevant support]
+    C -- Yes --> E[Retrieve relevant local policy sections]
+    E --> F{Evidence present and non-conflicting?}
+    F -- No --> G[Uncertainty or conflict response]
+    F -- Yes --> H[Apply selected prompt version]
+    H --> I{Gemini key configured?}
+    I -- No --> J[Deterministic document lookup]
+    I -- Yes --> K[Gemini structured JSON response]
+    J --> L[Verify exact citation and quote]
+    K --> L
+    L --> M{Citation and answer verified?}
+    M -- No --> G
+    M -- Yes --> N[Answer + source + confidence]

@@ -1,0 +1,9 @@
+# Fictional Sample Attendance Policy
+
+This document is fictional and created only to demonstrate CampusAnswer. It is not a Bennett University policy.
+
+## Section 4.2 | Minimum course attendance
+Students must maintain a minimum of 75% attendance in each course to be eligible for the end-term examination.
+
+## Section 4.3 | Attendance records
+Students should review their attendance records in the student portal and contact the course instructor about a suspected recording error.

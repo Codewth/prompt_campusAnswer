@@ -1,0 +1,9 @@
+# Fictional Sample Hostel Policy
+
+This document is fictional and created only to demonstrate CampusAnswer. It is not a Bennett University policy.
+
+## Section 3.1 | Residence entry time
+Residents should return to the residence hall by 10:00 pm. A resident expecting to arrive later should notify the residence desk in advance.
+
+## Section 3.2 | Residence visitors
+Visitors must register at the residence desk and follow the visiting hours posted at the residence entrance.

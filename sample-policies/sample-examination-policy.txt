@@ -1,0 +1,9 @@
+# Fictional Sample Examination Policy
+
+This document is fictional and created only to demonstrate CampusAnswer. It is not a Bennett University policy.
+
+## Section 5.1 | Examination eligibility
+To be eligible for an end-term examination, a student must satisfy the minimum attendance requirement stated in Section 4.2 and complete all required course assessments.
+
+## Section 5.4 | Examination queries
+Students should direct examination schedule and eligibility questions to the Examinations Office.

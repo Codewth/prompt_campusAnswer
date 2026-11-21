@@ -1,0 +1,6 @@
+# Fictional Sample Hostel Policy Amendment
+
+This document is fictional and created only to demonstrate conflict handling. It is not a Bennett University policy.
+
+## Section 3.1 | Residence entry time
+Residents should return to the residence hall by 9:00 pm. A resident expecting to arrive later should notify the residence desk in advance.
