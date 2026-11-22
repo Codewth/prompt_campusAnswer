@@ -71,6 +71,8 @@ logger = logging.getLogger(__name__)
 GEMINI_MODEL_DEFAULT = "gemini-3.8-flash"
 GEMINI_CONNECT_TIMEOUT_SECONDS = 5
 GEMINI_READ_TIMEOUT_SECONDS = 45
+GEMINI_MAX_RETRIES = 1
+GEMINI_RETRY_BACKOFF_SECONDS = 0.5
 MAX_POLICY_EVIDENCE_CHUNKS = 5
 MAX_POLICY_EVIDENCE_CHARS = 12_000
 MAX_HISTORY_MESSAGES = 8
@@ -500,7 +502,11 @@ def _verify_and_normalize(
     )
 
 
-def _gemini_json_response(system_prompt: str, contents: list[dict], schema: dict) -> dict:
+def _gemini_generate_text(
+    system_prompt: str,
+    contents: list[dict],
+    generation_config: dict | None = None,
+) -> str:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise GeminiUnavailableError(
@@ -510,40 +516,80 @@ def _gemini_json_response(system_prompt: str, contents: list[dict], schema: dict
     request_body = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": schema,
-            "thinkingConfig": {"thinkingLevel": "low"},
-        },
     }
+    if generation_config is not None:
+        request_body["generationConfig"] = generation_config
     started = time.perf_counter()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    try:
-        response = GEMINI_HTTP_CLIENT.post(
-            url,
-            json=request_body,
-            headers={"x-goog-api-key": api_key},
-        )
-    except httpx.TimeoutException as error:
-        logger.warning(
-            "Gemini network timeout model=%s phase=%s elapsed_ms=%d",
-            model,
-            type(error).__name__,
-            round((time.perf_counter() - started) * 1000),
-        )
-        raise GeminiTimeoutError() from error
-    except httpx.RequestError as error:
-        logger.warning(
-            "Gemini network request failed model=%s error_type=%s elapsed_ms=%d",
-            model,
-            type(error).__name__,
-            round((time.perf_counter() - started) * 1000),
-        )
-        raise GeminiUnavailableError(
-            "Could not reach Gemini. Check the backend network and try again.",
-            status_code=502,
-        ) from error
+    response = None
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        try:
+            response = GEMINI_HTTP_CLIENT.post(
+                url,
+                json=request_body,
+                headers={"x-goog-api-key": api_key},
+            )
+        except (httpx.ConnectTimeout, httpx.ConnectError) as error:
+            retrying = attempt < GEMINI_MAX_RETRIES
+            logger.warning(
+                "Gemini connection failure model=%s phase=%s attempt=%d elapsed_ms=%d retry=%s",
+                model,
+                type(error).__name__,
+                attempt + 1,
+                round((time.perf_counter() - started) * 1000),
+                retrying,
+            )
+            if retrying:
+                time.sleep(GEMINI_RETRY_BACKOFF_SECONDS)
+                continue
+            if isinstance(error, httpx.ConnectTimeout):
+                raise GeminiTimeoutError() from error
+            raise GeminiUnavailableError(
+                "Could not connect to Gemini. Check the backend network and try again.",
+                status_code=502,
+            ) from error
+        except httpx.ReadTimeout as error:
+            logger.warning(
+                "Gemini network timeout model=%s phase=ReadTimeout attempt=%d elapsed_ms=%d retry=false reason=avoid_duplicate_generation",
+                model,
+                attempt + 1,
+                round((time.perf_counter() - started) * 1000),
+            )
+            raise GeminiTimeoutError() from error
+        except httpx.TimeoutException as error:
+            logger.warning(
+                "Gemini network timeout model=%s phase=%s attempt=%d elapsed_ms=%d retry=false",
+                model,
+                type(error).__name__,
+                attempt + 1,
+                round((time.perf_counter() - started) * 1000),
+            )
+            raise GeminiTimeoutError() from error
+        except httpx.RequestError as error:
+            logger.warning(
+                "Gemini network request failed model=%s error_type=%s attempt=%d elapsed_ms=%d",
+                model,
+                type(error).__name__,
+                attempt + 1,
+                round((time.perf_counter() - started) * 1000),
+            )
+            raise GeminiUnavailableError(
+                "Could not reach Gemini. Check the backend network and try again.",
+                status_code=502,
+            ) from error
 
+        if response.status_code == 503 and attempt < GEMINI_MAX_RETRIES:
+            logger.warning(
+                "Gemini transient upstream error model=%s http_status=503 attempt=%d retry=true elapsed_ms=%d",
+                model,
+                attempt + 1,
+                round((time.perf_counter() - started) * 1000),
+            )
+            time.sleep(GEMINI_RETRY_BACKOFF_SECONDS)
+            continue
+        break
+
+    assert response is not None
     elapsed_ms = round((time.perf_counter() - started) * 1000)
     if response.status_code >= 400:
         try:
@@ -589,8 +635,34 @@ def _gemini_json_response(system_prompt: str, contents: list[dict], schema: dict
         raise GeminiUnavailableError("Gemini returned an invalid response.") from error
     try:
         text = result["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise GeminiUnavailableError("Gemini returned an invalid response.") from error
+    if not isinstance(text, str) or not text.strip():
+        raise GeminiUnavailableError("Gemini returned an empty response.")
+    return text
+
+
+def _gemini_text_response(system_prompt: str, contents: list[dict]) -> str:
+    return _gemini_generate_text(
+        system_prompt,
+        contents,
+        {"maxOutputTokens": 24, "temperature": 0},
+    )
+
+
+def _gemini_json_response(system_prompt: str, contents: list[dict], schema: dict) -> dict:
+    text = _gemini_generate_text(
+        system_prompt,
+        contents,
+        {
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "thinkingConfig": {"thinkingLevel": "low"},
+        },
+    )
+    try:
         payload = json.loads(text)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
+    except json.JSONDecodeError as error:
         raise GeminiUnavailableError("Gemini returned an invalid structured response.") from error
     if not isinstance(payload, dict):
         raise GeminiUnavailableError("Gemini returned an invalid structured response.")

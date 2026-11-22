@@ -103,6 +103,30 @@ def test_general_answer_uses_gemini_and_has_no_policy_citations(monkeypatch):
     assert requests[0][1]["json"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
 
 
+def test_plain_gemini_request_omits_json_schema(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": "OK"}]}}]}
+
+    requests = []
+
+    def fake_post(url, **kwargs):
+        requests.append(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
+    result = engine._gemini_text_response("Reply with only OK.", [{"role": "user", "parts": [{"text": "OK"}]}])
+
+    assert result == "OK"
+    assert len(requests) == 1
+    assert "responseSchema" not in requests[0]["json"].get("generationConfig", {})
+    assert "responseMimeType" not in requests[0]["json"].get("generationConfig", {})
+    assert "generationConfig" in requests[0]["json"]
+
+
 @pytest.mark.parametrize(
     ("status_code", "provider_status", "expected_status", "message"),
     [
@@ -113,8 +137,11 @@ def test_general_answer_uses_gemini_and_has_no_policy_citations(monkeypatch):
 )
 def test_gemini_upstream_errors_are_classified(monkeypatch, status_code, provider_status, expected_status, message):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(engine.time, "sleep", lambda _: None)
+    requests = []
 
     def fake_post(url, **kwargs):
+        requests.append(url)
         return httpx.Response(
             status_code,
             json={"error": {"status": provider_status, "message": "provider diagnostic"}},
@@ -125,18 +152,91 @@ def test_gemini_upstream_errors_are_classified(monkeypatch, status_code, provide
     with pytest.raises(GeminiUnavailableError, match=message) as error:
         engine._gemini_json_response("prompt", [], {})
     assert error.value.status_code == expected_status
+    assert len(requests) == (2 if status_code == 503 else 1)
 
 
 def test_gemini_network_timeout_has_gateway_timeout_status(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    requests = []
 
     def fake_post(url, **kwargs):
+        requests.append(url)
         raise httpx.ReadTimeout("timed out")
 
     monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
     with pytest.raises(GeminiUnavailableError, match="too long to respond") as error:
         engine._gemini_json_response("prompt", [], {})
     assert error.value.status_code == 504
+    assert len(requests) == 1
+
+
+def test_gemini_connect_timeout_retries_once(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(engine.time, "sleep", lambda _: None)
+    responses = [
+        httpx.ConnectTimeout("connection timed out"),
+        httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": '{"answer":"OK"}'}]}}]},
+            request=httpx.Request("POST", "https://example.test"),
+        ),
+    ]
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        result = responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
+    assert engine._gemini_json_response("prompt", [], {}) == {"answer": "OK"}
+    assert len(calls) == 2
+
+
+def test_gemini_503_retry_is_bounded_to_one(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(engine.time, "sleep", lambda _: None)
+    requests = []
+
+    def fake_post(url, **kwargs):
+        requests.append(url)
+        return httpx.Response(
+            503,
+            json={"error": {"status": "UNAVAILABLE", "message": "busy"}},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
+    with pytest.raises(GeminiUnavailableError) as error:
+        engine._gemini_json_response("prompt", [], {})
+    assert error.value.status_code == 503
+    assert len(requests) == 2
+
+
+def test_gemini_503_retry_can_recover(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(engine.time, "sleep", lambda _: None)
+    responses = [
+        httpx.Response(
+            503,
+            json={"error": {"status": "UNAVAILABLE", "message": "busy"}},
+            request=httpx.Request("POST", "https://example.test"),
+        ),
+        httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": '{"answer":"OK"}'}]}}]},
+            request=httpx.Request("POST", "https://example.test"),
+        ),
+    ]
+
+    def fake_post(url, **kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
+    assert engine._gemini_json_response("prompt", [], {}) == {"answer": "OK"}
+    assert responses == []
 
 
 def test_general_follow_up_includes_prior_turn_as_context(monkeypatch):
