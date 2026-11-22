@@ -1,10 +1,11 @@
 import json
+import logging
 import os
 import re
-import urllib.error
-import urllib.request
+import time
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 
 from .models import AnswerResponse, AnswerSegment, Citation, ConversationMessage, PolicySection
@@ -66,9 +67,50 @@ MIXED_SPLIT = re.compile(
 )
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
+logger = logging.getLogger(__name__)
+GEMINI_MODEL_DEFAULT = "gemini-3.8-flash"
+GEMINI_CONNECT_TIMEOUT_SECONDS = 5
+GEMINI_READ_TIMEOUT_SECONDS = 25
+MAX_POLICY_EVIDENCE_CHUNKS = 5
+MAX_POLICY_EVIDENCE_CHARS = 12_000
+MAX_HISTORY_MESSAGES = 8
+MAX_HISTORY_MESSAGE_CHARS = 1_200
+GEMINI_HTTP_CLIENT = httpx.Client(
+    timeout=httpx.Timeout(
+        connect=GEMINI_CONNECT_TIMEOUT_SECONDS,
+        read=GEMINI_READ_TIMEOUT_SECONDS,
+        write=10,
+        pool=5,
+    )
+)
+
 
 class GeminiUnavailableError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int = 503):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class GeminiRateLimitError(GeminiUnavailableError):
+    def __init__(self):
+        super().__init__("Gemini rate limit reached. Wait a little, then retry.", status_code=429)
+
+
+class GeminiServiceUnavailableError(GeminiUnavailableError):
+    def __init__(self):
+        super().__init__("Gemini is temporarily unavailable. Please retry shortly.", status_code=503)
+
+
+class GeminiTimeoutError(GeminiUnavailableError):
+    def __init__(self):
+        super().__init__("Gemini took too long to respond. Please retry.", status_code=504)
+
+
+def gemini_runtime_status() -> dict[str, str | bool]:
+    return {
+        "configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+        "model": os.getenv("GEMINI_MODEL", GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT,
+    }
 
 
 def classify(question: str) -> str:
@@ -210,6 +252,19 @@ def retrieve(question: str, category: str, sections: list[PolicySection]) -> lis
     return [section for score, section in candidates[:5] if score > 0]
 
 
+def _bounded_evidence(evidence: list[PolicySection]) -> list[PolicySection]:
+    bounded = []
+    total_chars = 0
+    for section in evidence:
+        if len(bounded) >= MAX_POLICY_EVIDENCE_CHUNKS:
+            break
+        if total_chars + len(section.text) > MAX_POLICY_EVIDENCE_CHARS:
+            continue
+        bounded.append(section)
+        total_chars += len(section.text)
+    return bounded
+
+
 def _unsupported(
     category: str,
     reason: str,
@@ -334,10 +389,25 @@ def _answer_policy(
             version,
             collection=collection,
         )
+    retrieval_started = time.perf_counter()
     if collection == "official":
-        evidence = search_official(retrieval_question, category)
+        retrieval_limit = 10 if category == "attendance" else MAX_POLICY_EVIDENCE_CHUNKS
+        retrieved_evidence = search_official(retrieval_question, category, limit=retrieval_limit)
     else:
-        evidence = retrieve(retrieval_question, category, [section for doc in list_documents() for section in doc.sections])
+        retrieved_evidence = retrieve(
+            retrieval_question,
+            category,
+            [section for doc in list_documents() for section in doc.sections],
+        )
+    evidence = _bounded_evidence(retrieved_evidence)
+    logger.info(
+        "Policy retrieval completed collection=%s category=%s chunks=%d context_chars=%d elapsed_ms=%d",
+        collection,
+        category,
+        len(evidence),
+        sum(len(section.text) for section in evidence),
+        round((time.perf_counter() - retrieval_started) * 1000),
+    )
     if not evidence:
         return _unsupported(
             category,
@@ -345,6 +415,13 @@ def _answer_policy(
             version,
             collection=collection,
         )
+    attendance_conflicts = (
+        _official_attendance_conflict_sections(retrieved_evidence)
+        if collection == "official" and category == "attendance"
+        else []
+    )
+    if attendance_conflicts:
+        return _official_attendance_conflict_response(attendance_conflicts, version)
     if _requested_detail_missing(question, evidence):
         return _unsupported(
             category,
@@ -352,14 +429,7 @@ def _answer_policy(
             version,
             collection=collection,
         )
-    attendance_conflicts = (
-        _official_attendance_conflict_sections(evidence)
-        if collection == "official" and category == "attendance"
-        else []
-    )
-    if attendance_conflicts:
-        return _official_attendance_conflict_response(attendance_conflicts, version)
-    if _contradiction(evidence):
+    if _contradiction(retrieved_evidence):
         return _unsupported(
             category,
             "The selected policy documents contain conflicting sections on this topic. Please contact the relevant university office for clarification.",
@@ -434,32 +504,84 @@ def _gemini_json_response(system_prompt: str, contents: list[dict], schema: dict
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise GeminiUnavailableError(
-            "Gemini is not configured. Set GEMINI_API_KEY in the root .env and restart the backend to answer this message."
+            "Gemini is not configured on this backend. Ask an administrator to set GEMINI_API_KEY."
         )
-    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    model = os.getenv("GEMINI_MODEL", GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT
     request_body = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
         "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
     }
-    request = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        data=json.dumps(request_body).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        method="POST",
-    )
+    started = time.perf_counter()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
+        response = GEMINI_HTTP_CLIENT.post(
+            url,
+            json=request_body,
+            headers={"x-goog-api-key": api_key},
+        )
+    except httpx.TimeoutException as error:
+        logger.warning(
+            "Gemini network timeout model=%s phase=%s elapsed_ms=%d",
+            model,
+            type(error).__name__,
+            round((time.perf_counter() - started) * 1000),
+        )
+        raise GeminiTimeoutError() from error
+    except httpx.RequestError as error:
+        logger.warning(
+            "Gemini network request failed model=%s error_type=%s elapsed_ms=%d",
+            model,
+            type(error).__name__,
+            round((time.perf_counter() - started) * 1000),
+        )
         raise GeminiUnavailableError(
-            f"Gemini request failed with HTTP {error.code}. Check the model and API key configuration."
+            "Could not reach Gemini. Check the backend network and try again.",
+            status_code=502,
         ) from error
-    except urllib.error.URLError as error:
-        raise GeminiUnavailableError("Could not reach Gemini. Check the network and API configuration.") from error
-    except TimeoutError as error:
-        raise GeminiUnavailableError("The Gemini request timed out. Please try again.") from error
-    except json.JSONDecodeError as error:
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+    if response.status_code >= 400:
+        try:
+            provider_error = response.json().get("error", {})
+        except (ValueError, AttributeError):
+            provider_error = {}
+        if not isinstance(provider_error, dict):
+            provider_error = {}
+        provider_status = str(provider_error.get("status", "UNKNOWN"))
+        provider_message = str(provider_error.get("message", ""))
+        if api_key:
+            provider_message = provider_message.replace(api_key, "[REDACTED]")
+        logger.warning(
+            "Gemini upstream error model=%s http_status=%d provider_status=%s elapsed_ms=%d message=%s",
+            model,
+            response.status_code,
+            provider_status,
+            elapsed_ms,
+            provider_message[:300],
+        )
+        if response.status_code == 429:
+            raise GeminiRateLimitError()
+        if response.status_code == 503 or response.status_code >= 500:
+            raise GeminiServiceUnavailableError()
+        if response.status_code == 404:
+            raise GeminiUnavailableError(
+                f"Gemini model '{model}' was not found. Check GEMINI_MODEL in the backend settings.",
+                status_code=502,
+            )
+        if response.status_code in {401, 403}:
+            raise GeminiUnavailableError(
+                "Gemini rejected the API key or model access. Check the key and model permissions in backend settings.",
+                status_code=502,
+            )
+        raise GeminiUnavailableError(
+            f"Gemini rejected the request (HTTP {response.status_code}). Check the model and request configuration.",
+            status_code=502,
+        )
+    logger.info("Gemini request completed model=%s http_status=%d elapsed_ms=%d", model, response.status_code, elapsed_ms)
+    try:
+        result = response.json()
+    except (ValueError, TypeError) as error:
         raise GeminiUnavailableError("Gemini returned an invalid response.") from error
     try:
         text = result["candidates"][0]["content"]["parts"][0]["text"]
@@ -473,9 +595,11 @@ def _gemini_json_response(system_prompt: str, contents: list[dict], schema: dict
 
 def _history_contents(history: list[ConversationMessage]) -> list[dict]:
     contents: list[dict] = []
-    for message in history[-12:]:
+    for message in history[-MAX_HISTORY_MESSAGES:]:
         role = "model" if message.role == "assistant" else "user"
-        text = f"[{message.response_type}] {message.content}" if message.response_type else message.content
+        text = message.content[:MAX_HISTORY_MESSAGE_CHARS]
+        if message.response_type:
+            text = f"[{message.response_type}] {text}"
         if contents and contents[-1]["role"] == role:
             contents[-1]["parts"][0]["text"] += f"\n{text}"
         else:

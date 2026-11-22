@@ -103,6 +103,10 @@ General knowledge and evidence-backed answer generation require Gemini. Without 
 3. Optionally set `GEMINI_MODEL` to a model available to your API account. The default is `gemini-3.8-flash`, listed as a stable model in the [Gemini API model catalog](https://ai.google.dev/gemini-api/docs/models) (checked against the current catalog).
 4. Restart the backend. Gemini errors are reported by the API; they do not silently turn into demo answers.
 
+`GET /api/health` reports whether a Gemini key is configured and the active model name; it never returns the key. Google documents `gemini-3.8-flash` as a stable model with structured-output support, but free-tier access is limited to selected models and quotas, so availability for a particular API key must be verified by an actual request. No paid tier is required or enabled by this project.
+
+The backend reuses an HTTP client and applies a 5-second connect timeout and 25-second read timeout. Network timeouts return HTTP 504, rate limits return HTTP 429, and upstream service outages return HTTP 503; upstream status and model diagnostics are logged without logging the API key or student question. The chat UI allows 90 seconds for a response to accommodate Render Free cold starts and offers a manual Retry button; requests are not retried automatically. Official policy generation receives at most five relevant chunks and 12,000 characters of evidence, while attendance conflict checks inspect a wider retrieved set so conflicting source rules are not dropped.
+
 The Gemini policy workflow passes the retrieved document excerpts, question, relevant history, and selected prompt to the model. The response is parsed as JSON. A supported response is accepted only if its document and section match retrieved evidence, its quotation is an exact substring of that evidence, and its answer is itself contained verbatim in a verified quote. Otherwise, the API returns an uncertainty response. This conservative policy avoids unsupported paraphrases. General-knowledge answers use a separate prompt and carry no policy citations.
 
 ## Documents

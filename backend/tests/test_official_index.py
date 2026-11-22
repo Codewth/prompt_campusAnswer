@@ -67,7 +67,7 @@ def test_conflicting_official_attendance_claims_are_both_cited(monkeypatch):
         ),
     ]
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setattr(engine, "search_official", lambda question, category: sources)
+    monkeypatch.setattr(engine, "search_official", lambda question, category, **kwargs: sources)
 
     response = engine.answer_question(
         "What minimum attendance percentage is required in a course?",
@@ -105,7 +105,7 @@ def test_hostel_curfew_is_not_inferred_from_unrelated_schedule_times(monkeypatch
         page=3,
     )
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setattr(engine, "search_official", lambda question, category: [section])
+    monkeypatch.setattr(engine, "search_official", lambda question, category, **kwargs: [section])
 
     response = engine.answer_question("What is the exact hostel curfew time?", collection="official")
 

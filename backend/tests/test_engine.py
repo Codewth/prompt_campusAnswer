@@ -1,12 +1,13 @@
 import json
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from cryptography.hazmat.primitives.asymmetric import rsa
 import jwt
 
-from app import auth, engine
+from app import auth, engine, main
 from app.engine import GeminiUnavailableError, _verify_and_normalize, answer_question, classify
 from app.main import _cors_origins, app
 from app.models import ConversationMessage, PolicyDocument, PolicySection
@@ -76,24 +77,19 @@ def test_gemini_unavailable_is_an_explicit_error_not_a_fallback(monkeypatch):
 
 def test_general_answer_uses_gemini_and_has_no_policy_citations(monkeypatch):
     class FakeResponse:
-        def __enter__(self):
-            return self
+        status_code = 200
 
-        def __exit__(self, exc_type, exc_value, traceback):
-            return False
-
-        def read(self):
-            response = {"candidates": [{"content": {"parts": [{"text": json.dumps({"answer": "RAG retrieves relevant context before generation."})}]}}]}
-            return json.dumps(response).encode()
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps({"answer": "RAG retrieves relevant context before generation."})}]}}]}
 
     requests = []
 
-    def fake_urlopen(request, timeout):
-        requests.append(request)
+    def fake_post(url, **kwargs):
+        requests.append((url, kwargs))
         return FakeResponse()
 
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
-    monkeypatch.setattr(engine.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
     response = answer_question("Explain RAG")
 
     assert response.response_type == "general_knowledge"
@@ -101,8 +97,45 @@ def test_general_answer_uses_gemini_and_has_no_policy_citations(monkeypatch):
     assert response.mode == "gemini"
     assert response.citations == [] and response.confidence is None
     assert len(requests) == 1
-    assert requests[0].get_header("X-goog-api-key") == "test-key-not-real"
-    assert "test-key-not-real" not in requests[0].full_url
+    assert requests[0][1]["headers"]["x-goog-api-key"] == "test-key-not-real"
+    assert "test-key-not-real" not in requests[0][0]
+    assert requests[0][0].endswith("/models/gemini-3.8-flash:generateContent")
+
+
+@pytest.mark.parametrize(
+    ("status_code", "provider_status", "expected_status", "message"),
+    [
+        (429, "RESOURCE_EXHAUSTED", 429, "rate limit"),
+        (503, "UNAVAILABLE", 503, "temporarily unavailable"),
+        (404, "NOT_FOUND", 502, "was not found"),
+    ],
+)
+def test_gemini_upstream_errors_are_classified(monkeypatch, status_code, provider_status, expected_status, message):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+
+    def fake_post(url, **kwargs):
+        return httpx.Response(
+            status_code,
+            json={"error": {"status": provider_status, "message": "provider diagnostic"}},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
+    with pytest.raises(GeminiUnavailableError, match=message) as error:
+        engine._gemini_json_response("prompt", [], {})
+    assert error.value.status_code == expected_status
+
+
+def test_gemini_network_timeout_has_gateway_timeout_status(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+
+    def fake_post(url, **kwargs):
+        raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
+    with pytest.raises(GeminiUnavailableError, match="too long to respond") as error:
+        engine._gemini_json_response("prompt", [], {})
+    assert error.value.status_code == 504
 
 
 def test_general_follow_up_includes_prior_turn_as_context(monkeypatch):
@@ -219,6 +252,67 @@ def test_gemini_configuration_error_is_returned_by_chat_api(monkeypatch):
         )
     assert response.status_code == 503
     assert "GEMINI_API_KEY" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(("status_code", "expected_status"), [(429, 429), (503, 503), (504, 504)])
+def test_chat_api_preserves_gemini_failure_status(monkeypatch, status_code, expected_status):
+    monkeypatch.setattr(
+        auth,
+        "decode_id_token",
+        lambda token: {"uid": "user-1", "exp": int(time.time()) + 3600, "auth_time": int(time.time()) - 10},
+    )
+    monkeypatch.setattr(
+        main,
+        "answer_question",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GeminiUnavailableError("Gemini failed.", status_code=status_code)
+        ),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/ask",
+            headers={"Authorization": "Bearer verified-test-token"},
+            json={"question": "What is Python?"},
+        )
+    assert response.status_code == expected_status
+
+
+def test_official_attendance_conflict_survives_retrieval_context_limit():
+    response = answer_question("What is the minimum attendance requirement?", collection="official")
+    assert response.status == "conflict"
+    assert len(response.citations) == 2
+
+
+def test_policy_generation_receives_bounded_retrieved_context(monkeypatch):
+    sections = [
+        PolicySection(
+            document=f"Document {index}",
+            section=f"Section {index}",
+            title=f"Rule {index}",
+            text=f"Evidence {index}. " + ("x" * 3000),
+            fictional=False,
+            collection="official",
+            source_type="official",
+        )
+        for index in range(10)
+    ]
+    captured = {}
+
+    def fake_search(question, category, limit):
+        assert limit == engine.MAX_POLICY_EVIDENCE_CHUNKS
+        return sections[:limit]
+
+    def fake_generation(question, category, evidence, version, collection, history):
+        captured["evidence"] = evidence
+        return engine._unsupported(category, "No answer needed for this test.", version, collection=collection)
+
+    monkeypatch.setattr(engine, "search_official", fake_search)
+    monkeypatch.setattr(engine, "_gemini_answer", fake_generation)
+    engine._answer_policy("What are examination rules?", "examination rules", "exams", "v3", "official", [])
+
+    assert len(captured["evidence"]) <= engine.MAX_POLICY_EVIDENCE_CHUNKS
+    assert sum(len(section.text) for section in captured["evidence"]) <= engine.MAX_POLICY_EVIDENCE_CHARS
+    assert [section.document for section in captured["evidence"]] == [f"Document {index}" for index in range(3)]
 
 
 def test_model_response_requires_exact_evidence_and_grounded_answer():

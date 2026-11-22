@@ -9,6 +9,7 @@ import {
 import { LOGOUT_WARNING_KEY, RETURN_TO_KEY, safeReturnPath, useAuth } from "./AuthContext.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const CHAT_REQUEST_TIMEOUT_MS = 90_000;
 const links = [
   { id: "dashboard", label: "Overview", icon: Home },
   { id: "chat", label: "Ask CampusAnswer", icon: MessageCircle },
@@ -500,20 +501,26 @@ function Chat({ history, setHistory, navigate, authorizedFetch }) {
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [retryRequest, setRetryRequest] = useState(null);
   const [version, setVersion] = useState("v3");
   const [collection, setCollection] = useState("official");
   const scrollRef = useRef(null);
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [history, loading]);
-  const submit = async (value = question) => {
+  const submit = async (value = question, retryId = null) => {
     const text = value.trim();
     if (!text || loading) return;
     setQuestion(""); setError(""); setLoading(true);
-    const id = `${Date.now()}-${Math.random()}`;
-    setHistory((items) => [...items, { id, question: text, pending: true }]);
+    if (!retryId) setRetryRequest(null);
+    const id = retryId || `${Date.now()}-${Math.random()}`;
+    setHistory((items) => retryId
+      ? items.map((item) => item.id === retryId ? { ...item, pending: true } : item)
+      : [...items, { id, question: text, pending: true }]);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CHAT_REQUEST_TIMEOUT_MS);
     try {
-      const context = history.filter((item) => !item.pending).slice(-6).flatMap((item) => {
+      const context = history.filter((item) => !item.pending && item.id !== retryId).slice(-6).flatMap((item) => {
         const messages = [{ role: "user", content: item.question }];
         if (item.answer) {
           const answerText = item.answer.segments?.length
@@ -532,6 +539,7 @@ function Chat({ history, setHistory, navigate, authorizedFetch }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: text, prompt_version: version, collection, history: context }),
+        signal: controller.signal,
       });
       const data = await response.json();
       if (!response.ok) {
@@ -539,18 +547,25 @@ function Chat({ history, setHistory, navigate, authorizedFetch }) {
         throw new Error(detail || "The assistant could not answer right now.");
       }
       setHistory((items) => items.map((item) => item.id === id ? { ...item, answer: data, pending: false } : item));
+      setRetryRequest(null);
     } catch (requestError) {
       setHistory((items) => items.map((item) => item.id === id ? { ...item, pending: false } : item));
-      setError(requestError instanceof TypeError
-        ? "Could not reach CampusAnswer. Check that the backend is running."
-        : requestError.message || "The assistant could not answer right now.");
-    } finally { setLoading(false); }
+      setRetryRequest({ id, question: text });
+      setError(requestError.name === "AbortError"
+        ? "CampusAnswer did not respond within 90 seconds. The free service may be waking up; please retry."
+        : requestError instanceof TypeError
+          ? "Could not reach CampusAnswer. Check your connection and try again."
+          : requestError.message || "The assistant could not answer right now.");
+    } finally {
+      clearTimeout(timeoutId);
+      setLoading(false);
+    }
   };
   return <div className="page-content chat-page">
-    <div className="page-title-row"><div><div className="eyebrow">THE POLICY ASSISTANT</div><h1>Ask CampusAnswer</h1><p>Ask general questions or find policy answers grounded in supplied documents.</p></div><button className="button-outline clear-button" onClick={() => setHistory([])} disabled={!history.length}><Plus size={16} /> New conversation</button></div>
+    <div className="page-title-row"><div><div className="eyebrow">THE POLICY ASSISTANT</div><h1>Ask CampusAnswer</h1><p>Ask general questions or find policy answers grounded in supplied documents.</p></div><button className="button-outline clear-button" onClick={() => { setHistory([]); setError(""); setRetryRequest(null); }} disabled={!history.length}><Plus size={16} /> New conversation</button></div>
     <div className="chat-layout"><section className="chat-panel"><div className="chat-panel-head"><div className="assistant-identity"><span className="assistant-avatar"><Sparkles size={18} /></span><span><strong>CampusAnswer</strong><small><i className="online-dot" /> Ready to help</small></span></div><div className="chat-source-controls"><label className="version-select">Sources <select value={collection} onChange={(event) => setCollection(event.target.value)}><option value="official">Bennett official PDFs</option><option value="demo">Fictional samples &amp; uploads</option></select><ChevronDown size={13} /></label><label className="version-select">Prompt <select value={version} onChange={(event) => setVersion(event.target.value)}><option value="v1">Version 1 · Baseline</option><option value="v2">Version 2 · Improved</option><option value="v3">Version 3 · Final</option></select><ChevronDown size={13} /></label></div></div>
       <div className="chat-messages">{history.length === 0 ? <div className="chat-empty"><span className="empty-art"><MessageCircle size={25} /><Sparkles size={15} /></span><h2>What would you like to know?</h2><p>Ask general questions or look up attendance, exams, fees, and other policies.</p><div className="suggestion-list">{suggestions.map((item) => <button key={item} onClick={() => submit(item)}>{item}<ArrowRight size={14} /></button>)}</div><div className="chat-disclaimer"><ShieldCheck size={14} />{collection === "official" ? " Official Bennett PDFs only; policy answers include citations." : " Fictional samples and local uploads only."}</div></div> : <div className="message-list">{history.map((item) => <div className="conversation-turn" key={item.id}><div className="user-message"><span className="user-avatar">Y</span><span>{item.question}</span></div>{item.pending ? <div className="assistant-message"><span className="assistant-avatar"><Sparkles size={15} /></span><span className="typing-indicator"><i /><i /><i /> Preparing an answer…</span></div> : item.answer ? <AnswerCard answer={item.answer} /> : null}</div>)}
-      {error && <div className="inline-error"><Info size={16} />{error}</div>}<div ref={scrollRef} /></div>}</div>
+      {error && <div className="inline-error" role="alert"><Info size={16} /><span>{error}</span>{retryRequest && <button className="button-outline retry-button" onClick={() => submit(retryRequest.question, retryRequest.id)} disabled={loading}>Retry</button>}</div>}<div ref={scrollRef} /></div>}</div>
       <form className="composer" onSubmit={(event) => { event.preventDefault(); submit(); }}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submit(); } }} placeholder="Ask anything or ask about a university policy…" rows={1} maxLength={2000} /><div className="composer-bottom"><span><ShieldCheck size={13} /> Policy answers grounded in sources</span><button className="send-button" type="submit" disabled={!question.trim() || loading} aria-label="Send question">{loading ? <LoaderCircle size={17} className="spin" /> : <Send size={16} />}</button></div></form><div className="composer-footnote">General AI answers may need verification. Check cited documents and contact the relevant office for official policy guidance.</div>
     </section><aside className="chat-side"><div className="side-card"><div className="side-card-icon"><ShieldCheck size={18} /></div><h3>Trust, with receipts.</h3><p>Policy answers cite their source document, page, and supporting quotation. General responses are labeled separately.</p><div className="side-divider" /><div className="side-status"><span className="status-dot" /><span><b>Grounding check</b><small>Policy quotes are verified against source text</small></span></div></div><div className="side-card side-card-light"><h3>Try asking</h3><div className="side-prompts">{suggestions.map((item) => <button key={item} onClick={() => submit(item)}>{item}<ArrowRight size={14} /></button>)}</div><button className="browse-link" onClick={() => navigate("library")}>Browse policy library <ArrowRight size={14} /></button></div><div className="side-footnote"><Info size={14} /><span>{collection === "official" ? "Official documents may be dated; check the academic year and source PDF." : "Fictional demonstration content. Not official university guidance."}</span></div></aside></div>
   </div>;

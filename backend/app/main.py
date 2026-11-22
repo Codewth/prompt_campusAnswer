@@ -9,7 +9,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .auth import AuthenticatedUser, require_admin, require_user, revoke_firebase_refresh_tokens
 from .cloud_store import CloudStoreError, supabase_is_configured
-from .engine import GeminiUnavailableError, answer_question
+from .engine import GeminiUnavailableError, answer_question, gemini_runtime_status
 from .models import AskRequest, ProfileSettingsUpdate, ProfileUpdate, StudentProfileResponse
 from .official_index import OfficialIndexUnavailableError, list_official_documents
 from .policies import MAX_UPLOAD_BYTES, list_documents, save_upload
@@ -57,7 +57,11 @@ app.add_middleware(
 @app.get("/api/health")
 def health() -> dict:
     cloud_storage = supabase_is_configured()
-    return {"status": "ok", "persistence": "supabase" if cloud_storage else "local"}
+    return {
+        "status": "ok",
+        "persistence": "supabase" if cloud_storage else "local",
+        "gemini": gemini_runtime_status(),
+    }
 
 
 @app.get("/api/auth/me")
@@ -118,7 +122,8 @@ def ask(request: AskRequest, user: AuthenticatedUser = Depends(require_user)) ->
     except OfficialIndexUnavailableError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except GeminiUnavailableError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        logger.info("Chat request failed status=%d reason=%s", error.status_code, str(error))
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
     except CloudStoreError:
         raise
     except RuntimeError as error:

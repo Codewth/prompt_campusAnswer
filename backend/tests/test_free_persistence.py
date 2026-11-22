@@ -192,6 +192,8 @@ def test_upload_byte_limit_is_enforced_before_document_parsing():
 
 
 def test_free_deployment_health_requires_cloud_storage(monkeypatch, tmp_path):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
     monkeypatch.setenv("CAMPUSANSWER_REQUIRE_CLOUD_STORAGE", "true")
     local_database = tmp_path / "not-used.sqlite"
     monkeypatch.setenv("CAMPUSANSWER_AUTH_DATABASE", str(local_database))
@@ -206,4 +208,8 @@ def test_free_deployment_health_requires_cloud_storage(monkeypatch, tmp_path):
     with TestClient(app) as client:
         configured = client.get("/api/health")
     assert configured.status_code == 200
-    assert configured.json() == {"status": "ok", "persistence": "supabase"}
+    assert configured.json() == {
+        "status": "ok",
+        "persistence": "supabase",
+        "gemini": {"configured": False, "model": "gemini-3.8-flash"},
+    }
