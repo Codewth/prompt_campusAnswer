@@ -3,15 +3,15 @@
 **CampusAnswer: A Document-Grounded Prompt Workflow for University Policy Q&A**  
 Team GroundTruth · Problem C1 · SCSE4041 — Prompt Engineering · Milestone 2
 
-> **Demonstration project only.** The policies in `sample-policies/` are fictional examples for software and prompt-workflow testing. They are **not** Bennett University policies. Do not rely on this prototype for actual university requirements.
+> **Demonstration project only.** The policies in `sample-policies/` are fictional examples for software and prompt-workflow testing. They are **not** Bennett University policies. Official-source PDFs are a separate indexed collection and their dates do not prove current validity.
 
-CampusAnswer is a responsive university helpdesk prototype. It retrieves local policy sections, answers only from supplied evidence, verifies citations, and acknowledges missing or conflicting information. Gemini is optional; without a key, responses use deterministic document lookup and are labeled **DEMO LOOKUP** (not live AI).
+CampusAnswer is a responsive hybrid assistant. Safe greetings use predefined replies; general questions use Gemini; university-policy questions retrieve from the selected local document collection and use Gemini only when generation is needed. The backend verifies policy citations against retrieved text. Local conflict, clarification, and evidence-absence responses can be returned without Gemini. If Gemini is not configured or unavailable for a response that needs generation, the API reports an error instead of presenting deterministic lookup as an AI answer.
 
 ## Project structure
 
 ```text
-frontend/                 React + Vite + Tailwind dashboard
-backend/app/              FastAPI API, policy parser, retrieval, and answer workflow
+frontend/                 React + Vite + Tailwind dashboard with Firebase Google sign-in
+backend/app/              FastAPI API, Firebase token checks, official/demo retrieval, and hybrid answer workflow
 backend/tests/            Focused backend tests
 backend/run_evaluation.py Execute test-data/test-cases.json and save results
 prompts/v1..v3/           Baseline, improved, and final prompt iterations
@@ -26,7 +26,8 @@ docs/                     Milestone report, technical report, prompt log, diagra
 
 - Python 3.10 or later
 - Node.js 20 or later and npm
-- Gemini API key only for live Gemini responses; deterministic demo mode needs no credentials
+- Firebase project with Google sign-in enabled (required for app access)
+- Gemini API key for general-knowledge answers and policy responses requiring generation; safe greetings and local policy conflict/uncertainty checks do not need it
 
 ## Install
 
@@ -39,7 +40,7 @@ python -m pip install --upgrade pip
 python -m pip install -r backend\requirements.txt
 
 cd frontend
-npm install
+npm.cmd install
 cd ..
 ```
 
@@ -65,21 +66,44 @@ API health: <http://localhost:8000/api/health> · Interactive API docs: <http://
 
 ```powershell
 cd frontend
-npm run dev
+npm.cmd run dev
 ```
 
-Open <http://localhost:5174>. The frontend expects the API at `http://localhost:8000`.
+Open <http://localhost:5175>. Port 5174 is reserved for the separate CampusFind app in this development environment. The frontend expects the API at `http://localhost:8000`.
+
+## Google sign-in and Firebase setup
+
+CampusAnswer requires Google sign-in before accessing policy questions or documents. The backend verifies Firebase ID tokens; the browser never gets Firebase Admin credentials.
+
+1. In the [Firebase Console](https://console.firebase.google.com/), create/select a project and add a Web app.
+2. In **Authentication → Sign-in method**, enable **Google**. Add `localhost` to **Authentication → Settings → Authorized domains** for local testing.
+3. Copy the root `.env.example` to `.env`. Fill the `VITE_FIREBASE_*` values from the Web app config and set `FIREBASE_PROJECT_ID`.
+4. For the basic local demo, a Firebase Admin key is optional: the backend verifies Firebase ID-token signatures with Google's public signing keys and the configured project ID. To enable Firebase-wide refresh-token revocation checks, store a Firebase Admin service-account key **outside Git** and set `FIREBASE_SERVICE_ACCOUNT_PATH` (or `GOOGLE_APPLICATION_CREDENTIALS`) to its absolute local path.
+5. Set `FIREBASE_ADMIN_EMAILS` to a comma-separated allowlist of administrator email addresses. Only these verified accounts can upload policy files; other signed-in users can ask questions and read documents.
+6. Restart both the API and Vite after editing `.env`.
+
+Never commit `.env`, service-account JSON, private keys, or credentials. Firebase Web app configuration is injected into the frontend build; restrict the Firebase API key to the appropriate APIs and authorized domains in Google Cloud. If Firebase is not configured, the application displays a setup screen and protected API routes fail closed.
+
+**Authentication flow:** Firebase Google popup sign-in → Firebase ID token → `Authorization: Bearer …` → signature, project, time, and session verification → protected FastAPI endpoint. Public routes are `/`, `/about`, `/login`, and `/register`; `/dashboard`, `/chat`, `/documents`, `/evaluation`, and `/profile` require a verified account. Unauthenticated protected-route visits return to `/login` with the original destination preserved. `POST /api/auth/logout` revokes the active ID token in the local SQLite session ledger; if Firebase Admin credentials are configured, it also revokes Firebase refresh tokens. `GET /api/auth/me`, `GET /api/profile`, `PUT /api/profile`, `PATCH /api/profile/settings`, `GET /api/documents`, and `POST /api/ask` require a verified account. `POST /api/documents/upload` additionally requires an email in `FIREBASE_ADMIN_EMAILS`.
+
+### Student profile and account settings
+
+The authenticated sidebar account menu links to **My Profile**, **Account Settings**, and **Sign Out**. The profile page uses the signed-in Firebase account for the read-only email and Google photo/name fallback; missing student details are displayed as **Not provided** and are never guessed. Editable name, university, enrollment number, course, specialization, academic year, semester, and batch values are stored by verified Firebase UID in the local SQLite `student_profiles` table. The table shares `backend/auth-sessions.sqlite` with the local session ledger by default; `CAMPUSANSWER_PROFILE_DATABASE` can override its path. Theme preference is stored in the same row and restored after sign-in.
+
+Without Firebase Admin credentials, the backend can block the ID token used at logout but cannot revoke Firebase refresh tokens on other devices. The local session ledger is application-local and is not shared across multiple backend deployments. For deployment, configure Firebase Admin credentials and use a shared durable session/revocation store.
+
+The backend tests stub only the token verifier to exercise route authorization; they do not represent a live Firebase sign-in test. Complete one sign-in in a configured Firebase project to verify the real OAuth setup.
 
 ## Gemini configuration
 
-By default, the application uses deterministic retrieval and clearly labels each response **DEMO LOOKUP**. To enable Gemini:
+General knowledge and evidence-backed answer generation require Gemini. Without a configured key, those requests return a clear service-unavailable error; the application does not pretend a deterministic result was generated by AI. Predefined greetings, some local policy conflict responses, and explicit missing-evidence responses remain available without a key.
 
 1. Copy `.env.example` to `.env` at the project root.
 2. Set `GEMINI_API_KEY` in `.env`; do not commit `.env` or paste a key into source code.
-3. Optionally set `GEMINI_MODEL` to a model available to your API account. The default is `gemini-3.8-flash`, listed as a stable model in the [Gemini API model catalog](https://ai.google.dev/gemini-api/docs/models) (checked November 2026).
+3. Optionally set `GEMINI_MODEL` to a model available to your API account. The default is `gemini-3.8-flash`, listed as a stable model in the [Gemini API model catalog](https://ai.google.dev/gemini-api/docs/models) (checked against the current catalog).
 4. Restart the backend. Gemini errors are reported by the API; they do not silently turn into demo answers.
 
-The Gemini workflow passes only the retrieved document excerpts, question, and prompt to the model. The response is parsed as JSON. A supported response is accepted only if its document and section match retrieved evidence, its quotation is an exact substring of that evidence, and its answer is itself contained verbatim in a verified quote. Otherwise, the API returns an uncertainty response. This conservative policy avoids unsupported paraphrases.
+The Gemini policy workflow passes the retrieved document excerpts, question, relevant history, and selected prompt to the model. The response is parsed as JSON. A supported response is accepted only if its document and section match retrieved evidence, its quotation is an exact substring of that evidence, and its answer is itself contained verbatim in a verified quote. Otherwise, the API returns an uncertainty response. This conservative policy avoids unsupported paraphrases. General-knowledge answers use a separate prompt and carry no policy citations.
 
 ## Documents
 
@@ -97,6 +121,12 @@ The Gemini workflow passes only the retrieved document excerpts, question, and p
 - This is a local demonstration uploader, not an authenticated production administrator workflow. Only upload documents you are authorized to use.
 - For reproducible tests, the bundled fictional samples include a deliberate contradictory hostel amendment.
 
+## Official Bennett sources
+
+The optional `CampusAnswer_Official_Sources/` package keeps six public-source PDFs separate from fictional samples and local uploads. Follow its README to download, extract, OCR when needed, and build the local SQLite sparse TF-IDF index. The index preserves title, academic year or document date, source URL, page, and extraction method. It is local lexical retrieval, not an embedding database.
+
+The official collection is selected by default in chat. An attendance question that retrieves both the 70% SCSET rules excerpt and the 75% 2024-25 Examination Manual excerpt returns a conflict and cites both; it does not select one as authoritative. Other unsupported questions do not receive fabricated citations. A cited source date does not establish that the policy is still in force, and OCR quotations should be checked against the linked PDF page.
+
 ## Testing and evaluation
 
 Run the backend tests:
@@ -105,23 +135,15 @@ Run the backend tests:
 .\.venv\Scripts\python.exe -m pytest backend\tests -q
 ```
 
-Execute all input cases and write actual results:
+Execute all input cases against V1, V2, and V3 and write actual results:
 
 ```powershell
 .\.venv\Scripts\python.exe backend\run_evaluation.py
 ```
 
-Output is saved to `test-data/demo-evaluation-results.json`, including each expected/actual result, pass/fail, prompt version, mode, run timestamp, and summary. Each input is executed once for each of V1, V2, and V3 with the same configured model settings. The evaluation runner uses the configured backend; with no Gemini key it reports `deterministic_demo`, and with a key it reports `live_gemini`. A deterministic run does not establish that one prompt version performs better than another.
+The runner executes 18 distinct inputs (including edge, injection, missing-evidence, ambiguous, mixed-query, fee, hostel, and scholarship cases) under each prompt version. It writes the actual expected/output records to `test-data/demo-evaluation-results.json`, a tabular export to `test-data/evaluation-results.csv`, a prompt comparison summary to `test-data/prompt-comparison-log.json`, and mirrors the dashboard JSON to `frontend/public/`. Gemini-required errors are recorded as **blocked**, not passes or ordinary model failures; blocked runs are excluded from pass percentages. V1, V2, and V3 use identical inputs and the same configured model/settings.
 
-The currently recorded run is deterministic demo mode: **39/39 checks passed (100.0%)**, with **13/13** for each version. These results validate category, status, and citation-presence expectations in the local lookup path; they are not live-model quality measurements and do not show that one prompt is better.
-
-To show the current executed result in the dashboard, copy the generated file into Vite's public directory:
-
-```powershell
-Copy-Item test-data\demo-evaluation-results.json frontend\public\demo-evaluation-results.json
-```
-
-Rerun the evaluation and copy again to refresh the dashboard results.
+The checked-in output in this workspace records **54 attempts**: **30 passed, 0 failed, and 24 blocked** because `GEMINI_API_KEY` was not configured. Each version had 10 passed local checks and 8 blocked generation cases. The 100% pass rate is among the 30 evaluable local checks only; it is **not** a Gemini quality result. No input completed with Gemini under all three prompts, so prompt effectiveness has not been compared. Rerun the script after configuring Gemini to capture live outputs.
 
 ## Prompt versions
 
@@ -130,7 +152,7 @@ Rerun the evaluation and copy again to refresh the dashboard results.
 - `prompts/v3/prompt.txt` — grounding, exact quote, conflict, unrelated/multiple questions, injection handling, JSON, and confidence rules.
 - `prompts/final/prompt.txt` — final production-oriented workflow prompt.
 
-`docs/prompt-iteration-log.md` records design changes without claiming comparative effectiveness absent a controlled live-model evaluation.
+`docs/prompt-iteration-log.md` records design changes and the actual evaluation limitations without claiming comparative effectiveness absent comparable live-model outputs.
 
 ## Milestone 2 documentation
 
@@ -138,6 +160,7 @@ Rerun the evaluation and copy again to refresh the dashboard results.
 - Concise technical report: `docs/technical-report.md`
 - Prompt iteration log: `docs/prompt-iteration-log.md`
 - Mermaid diagrams: `docs/diagrams/`
+- Verified run evidence and submission checklist: `MILESTONE2_EVIDENCE.md`
 - Team contribution table is intentionally blank pending verified task and evidence records.
 
 ## Team
@@ -151,11 +174,28 @@ Rerun the evaluation and copy again to refresh the dashboard results.
 
 Individual contributions are not inferred. Fill the placeholders in `docs/milestone2-report.md` from verified evidence.
 
+## Render and Vercel deployment
+
+Deployment configuration is included but does not contain credentials:
+
+- `render.yaml` defines a Docker FastAPI service, `/api/health` check, and a 1 GB persistent disk mounted at `/var/data`. It uses Render's paid Starter service plan because the free web service does not provide the persistence required for profiles, revoked sessions, and uploads. Review Render's current billing before creating the service.
+- `Dockerfile` installs Tesseract, downloads/extracts the listed official PDFs, builds the local SQLite RAG index, and starts Uvicorn. Check the Render build log and generated ingestion report for extraction failures or pages still needing OCR.
+- `frontend/vercel.json` provides SPA fallback rewrites so direct React Router URLs can refresh. In Vercel, import the GitHub repository and set **Root Directory** to `frontend`; use `npm run build` and `dist`.
+
+Configure these values in the providers' environment-variable/secret settings, not in Git or chat:
+
+- **Render:** `FIREBASE_PROJECT_ID`, `GEMINI_API_KEY`, `CAMPUSANSWER_CORS_ORIGINS` set to the exact production Vercel origin (no wildcard), and `FIREBASE_ADMIN_EMAILS`. Render Blueprint prompts for these `sync: false` values. If account-wide Firebase refresh-token revocation is required, add a Firebase service-account JSON as a Render secret file and configure `FIREBASE_SERVICE_ACCOUNT_PATH`; never add it to the repository.
+- **Vercel:** `VITE_API_URL` set to the Render service origin, plus the `VITE_FIREBASE_*` web configuration values from Firebase.
+- **Firebase:** add the Vercel production domain under Authentication → Authorized domains, enable Google sign-in, and restrict the Web API key to the required Firebase APIs and domains.
+
+The Render disk paths are configured for the SQLite auth/profile database and uploaded documents. Official source PDFs and the index are rebuilt in the container image; uploaded files and user data persist on the disk. Preview Vercel domains are not automatically allowed by production CORS. After provider authentication and configuration, test health, Google sign-in, profile persistence, upload authorization, Gemini, and direct-route refresh on the deployed domains. No live provider deployment is claimed until these checks pass.
+
 ## Limitations
 
 - Sample policies are fictional and not official Bennett University guidance.
-- Local document retrieval uses lightweight lexical matching, not a production search index or semantic retriever.
+- Fictional-sample retrieval uses lightweight lexical matching; official-source retrieval uses a local sparse TF-IDF index. Neither is a production semantic retriever.
+- Gemini was not configured for the recorded evaluation. Live general-knowledge generation and generated policy responses were therefore not verified in that run.
 - Contradiction detection is deliberately narrow (same section title with differing text); it is not a comprehensive policy conflict resolver.
 - Quotation and answer checks are conservative and may decline a valid paraphrase.
-- Uploads are unauthenticated and local-only; this prototype is not suitable for deployment with sensitive documents.
+- Uploads require a verified account on the server-side administrator allowlist and are stored locally unless a persistent `CAMPUSANSWER_DOCUMENTS_DIR` is configured; this prototype is not suitable for sensitive documents or public deployment without further storage protections, audit logging, and policy validation.
 - Evaluation results are specific to their recorded run and mode. Deterministic demo outcomes are not Gemini model quality measurements.

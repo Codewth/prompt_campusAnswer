@@ -7,7 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .models import AnswerResponse, Citation, PolicySection
+from .models import AnswerResponse, AnswerSegment, Citation, ConversationMessage, PolicySection
+from .official_index import search_official
 from .policies import list_documents
 from .prompts import get_prompt
 
@@ -17,12 +18,16 @@ CONTACTS = {
     "exams": "Examinations Office",
     "fees": "Finance Office",
     "hostel": "Residence Life Office",
+    "scholarships": "Scholarship Office",
+    "campus": "Campus Administration Office",
 }
 KEYWORDS = {
-    "attendance": {"attendance", "attend", "class", "classes", "absent", "presence"},
+    "attendance": {"attendance", "attend", "absent", "presence"},
     "exams": {"exam", "exams", "examination", "eligibility", "assessment", "retake", "invigilator"},
     "fees": {"fee", "fees", "payment", "pay", "deadline", "tuition", "installment"},
     "hostel": {"hostel", "residence", "curfew", "visitor", "warden", "dorm"},
+    "scholarships": {"scholarship", "scholarships", "grant", "grants", "stipend"},
+    "campus": {"campus", "library", "parking", "security", "transport"},
 }
 STOP_WORDS = {
     "what", "when", "where", "which", "who", "how", "does", "do", "is", "are", "can",
@@ -43,18 +48,68 @@ SYNONYMS = {
 }
 GENERIC_TERMS = {"attendance", "examination", "fee", "residence", "policy"}
 SENSITIVE_CLAIM = re.compile(r"\b\d+(?:\.\d+)?\s*(?:%|percent|am|pm|hours?|days?|weeks?|months?|₹|rupees?)\b", re.I)
+CURRENT_POLICY_QUERY = re.compile(r"\b(?:current|currently|latest|most recent|as of now|this academic year)\b", re.I)
+CLOCK_TIME_QUERY = re.compile(r"\b(?:what time|at what time|curfew|hostel timings?|exact time)\b", re.I)
+CLOCK_TIME_VALUE = re.compile(r"\b(?:[01]?\d|2[0-3])(?:(?::|\.)[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?)\b", re.I)
+ATTENDANCE_PERCENTAGE = re.compile(
+    r"\b(?:minimum attendance(?: of)?|attendance requirement(?: of)?)\D{0,60}(\d+(?:\.\d+)?\s*%)",
+    re.I,
+)
+FOLLOW_UP = re.compile(
+    r"\b(?:explain|elaborate|clarify|expand)\b.*\b(?:previous|last|above|that|it|answer|response)\b"
+    r"|\b(?:why|how so|what does that mean|tell me more)\b",
+    re.I,
+)
+MIXED_SPLIT = re.compile(
+    r"(?<=[?;])\s*|\s+(?:and also|also|and)\s+(?=(?:what|when|where|who|why|how|explain|define|tell)\b)",
+    re.I,
+)
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
+class GeminiUnavailableError(RuntimeError):
+    pass
+
+
 def classify(question: str) -> str:
+    categories = _matched_policy_categories(question)
+    return categories[0] if len(categories) == 1 else "out_of_scope"
+
+
+def _matched_policy_categories(question: str) -> list[str]:
     normalized = set(re.findall(r"[a-z]+", _clean_question(question).lower()))
+    if "financial" in normalized and "aid" in normalized:
+        normalized.add("scholarship")
     scores = {category: len(normalized & terms) for category, terms in KEYWORDS.items()}
-    best = max(scores, key=scores.get)
-    if scores[best] == 0:
-        return "out_of_scope"
-    if sum(score > 0 for score in scores.values()) > 1:
-        return "out_of_scope"
-    return best
+    return [category for category, score in scores.items() if score > 0]
+
+
+def _conversation_response(question: str, version: str, collection: str) -> AnswerResponse | None:
+    normalized = re.sub(r"[^a-z0-9' ]", "", question.lower()).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    if re.fullmatch(r"(?:hi|hello|hey|hiya|good morning|good afternoon|good evening)", normalized):
+        answer = "Hello! I'm CampusAnswer. I can chat, answer general questions, or look up university policies in the supplied documents."
+    elif re.fullmatch(r"(?:how are you|how's it going|how are you doing)", normalized):
+        answer = "I'm doing well, thanks! I can help with general questions or find evidence in the supplied university policies."
+    elif re.fullmatch(r"(?:thanks|thank you|thanks a lot|thank you so much)", normalized):
+        answer = "You're welcome! Feel free to ask me another question."
+    elif re.fullmatch(r"(?:who are you|what is your name|introduce yourself|tell me about yourself)", normalized):
+        answer = "I'm CampusAnswer, an assistant for general questions and document-grounded university policy help."
+    else:
+        return None
+    return AnswerResponse(
+        category="out_of_scope",
+        answer=answer,
+        citations=[],
+        confidence=None,
+        status="supported",
+        contact=None,
+        mode="predefined",
+        prompt_version=version,
+        collection=collection,
+        response_type="general_conversation",
+        response_label="General conversation",
+    )
 
 
 def _clean_question(question: str) -> str:
@@ -72,6 +127,56 @@ def _has_multiple_questions(question: str) -> bool:
     words = set(re.findall(r"[a-z]+", _clean_question(question).lower()))
     mentioned_categories = sum(bool(words & keywords) for keywords in KEYWORDS.values())
     return mentioned_categories > 1
+
+
+def _last_history_message(
+    history: list[ConversationMessage],
+    role: str,
+) -> ConversationMessage | None:
+    return next((message for message in reversed(history) if message.role == role), None)
+
+
+def _follow_up_context(
+    question: str,
+    history: list[ConversationMessage],
+) -> tuple[str, str, str] | None:
+    if not FOLLOW_UP.search(question):
+        return None
+    previous_user = _last_history_message(history, "user")
+    previous_assistant = _last_history_message(history, "assistant")
+    prior_question = previous_user.content if previous_user else ""
+    response_type = previous_assistant.response_type if previous_assistant else None
+    category = previous_assistant.category if previous_assistant else None
+    latest_user_index = max(
+        (index for index, message in enumerate(history) if message.role == "user"),
+        default=-1,
+    )
+    latest_assistant_index = max(
+        (index for index, message in enumerate(history) if message.role == "assistant"),
+        default=-1,
+    )
+    if latest_user_index > latest_assistant_index:
+        response_type = None
+        category = classify(prior_question)
+    if response_type in {"verified_policy", "policy_unavailable", "demo_policy"}:
+        category = category or classify(prior_question)
+        if category != "out_of_scope":
+            return "policy", category, f"{prior_question}\n{question}".strip()
+    if response_type in {"general_conversation", "general_knowledge"}:
+        return "general_knowledge", "out_of_scope", question
+    if prior_question and classify(prior_question) != "out_of_scope":
+        return "policy", classify(prior_question), f"{prior_question}\n{question}".strip()
+    return "general_knowledge", "out_of_scope", question
+
+
+def _mixed_question_parts(question: str) -> list[tuple[str, str]] | None:
+    parts = [part.strip(" ,.") for part in MIXED_SPLIT.split(question) if part.strip(" ,.?;")]
+    if len(parts) < 2:
+        return None
+    routed = [(part, classify(part)) for part in parts]
+    has_policy = any(category != "out_of_scope" for _, category in routed)
+    has_general = any(category == "out_of_scope" for _, category in routed)
+    return routed if has_policy and has_general else None
 
 
 def retrieve(question: str, category: str, sections: list[PolicySection]) -> list[PolicySection]:
@@ -105,7 +210,13 @@ def retrieve(question: str, category: str, sections: list[PolicySection]) -> lis
     return [section for score, section in candidates[:5] if score > 0]
 
 
-def _unsupported(category: str, reason: str, version: str, status: str = "unsupported") -> AnswerResponse:
+def _unsupported(
+    category: str,
+    reason: str,
+    version: str,
+    status: str = "unsupported",
+    collection: str = "demo",
+) -> AnswerResponse:
     return AnswerResponse(
         category=category,
         answer=reason,
@@ -115,6 +226,9 @@ def _unsupported(category: str, reason: str, version: str, status: str = "unsupp
         contact=CONTACTS.get(category),
         mode="demo",
         prompt_version=version,
+        collection=collection,
+        response_type="policy_unavailable",
+        response_label="Policy information unavailable",
     )
 
 
@@ -126,38 +240,145 @@ def _contradiction(sections: list[PolicySection]) -> bool:
     return False
 
 
-def deterministic_answer(question: str, version: str = "v3") -> AnswerResponse:
-    if _has_multiple_questions(question):
-        return _unsupported("out_of_scope", "This message contains multiple questions. Please ask one policy question at a time so each answer can be checked against its own evidence.", version, "clarification_needed")
-    category = classify(question)
-    if category == "out_of_scope":
-        return _unsupported(category, "I can only help with attendance, exams, fees, and hostel policies. Please contact the relevant university office for other questions.", version, "refused")
+def _official_attendance_conflict_sections(sections: list[PolicySection]) -> list[PolicySection]:
+    sections_by_claim: dict[str, PolicySection] = {}
+    for section in sections:
+        if not re.search(r"\battendance\b", section.text, re.I):
+            continue
+        claims = ATTENDANCE_PERCENTAGE.findall(section.text)
+        for claim in claims:
+            normalized = re.sub(r"\s+", "", claim).lower()
+            sections_by_claim.setdefault(normalized, section)
+    if len(sections_by_claim) < 2:
+        return []
+    return list(sections_by_claim.values())
 
-    matches = retrieve(question, category, [section for doc in list_documents() for section in doc.sections])
-    if not matches:
-        return _unsupported(category, "The supplied policy documents do not contain enough information to answer this question.", version)
-    if _contradiction(matches):
-        return _unsupported(category, "The supplied policy documents contain conflicting sections on this topic. Please contact the relevant university office for clarification.", version, "conflict")
 
-    selected = matches[:1]
+def _official_attendance_conflict_response(
+    sections: list[PolicySection],
+    version: str,
+) -> AnswerResponse:
     return AnswerResponse(
-        category=category,
-        answer=selected[0].text,
+        category="attendance",
+        answer=(
+            "The retrieved official sources state different minimum attendance percentages. "
+            "Their available metadata does not establish which requirement currently applies. "
+            "Please contact the Academic Affairs Office to confirm."
+        ),
         citations=[
-            Citation(source_document=section.document, source_section=section.section, source_quote=section.text)
-            for section in selected
+            Citation(
+                source_document=section.document,
+                source_section=section.section,
+                source_quote=section.text,
+                collection=section.collection,
+                academic_year=section.academic_year,
+                source_url=section.source_url,
+                page=section.page,
+                extraction_method=section.extraction_method,
+            )
+            for section in sections
         ],
-        confidence="High",
-        status="supported",
-        contact=None,
+        confidence="Low",
+        status="conflict",
+        contact=CONTACTS["attendance"],
         mode="demo",
         prompt_version=version,
+        collection="official",
+        response_type="policy_unavailable",
+        response_label="Policy information unavailable",
     )
 
 
-def _verify_and_normalize(payload: dict, evidence: list[PolicySection], category: str, version: str) -> AnswerResponse:
+def _official_query_requires_unknown_current_policy(question: str, collection: str) -> bool:
+    return collection == "official" and bool(CURRENT_POLICY_QUERY.search(question))
+
+
+def _requested_detail_missing(question: str, evidence: list[PolicySection]) -> bool:
+    evidence_text = " ".join(section.text for section in evidence)
+    if CLOCK_TIME_QUERY.search(question):
+        if not CLOCK_TIME_VALUE.search(evidence_text):
+            return True
+        if re.search(r"\bcurfew\b", question, re.I):
+            curfew_time = re.compile(
+                rf"\bcurfew\b[^.!?\n]{{0,100}}{CLOCK_TIME_VALUE.pattern}|"
+                rf"{CLOCK_TIME_VALUE.pattern}[^.!?\n]{{0,100}}\bcurfew\b",
+                re.I,
+            )
+            if not curfew_time.search(evidence_text):
+                return True
+        if re.search(r"\bhostel timings?\b", question, re.I):
+            hostel_time = re.compile(
+                rf"\bhostel timings?\b[^.!?\n]{{0,100}}{CLOCK_TIME_VALUE.pattern}|"
+                rf"{CLOCK_TIME_VALUE.pattern}[^.!?\n]{{0,100}}\bhostel timings?\b",
+                re.I,
+            )
+            if not hostel_time.search(evidence_text):
+                return True
+    if re.search(r"\b(?:percentage|percent|%|rate)\b", question, re.I) and not re.search(r"\d+(?:\.\d+)?\s*%", evidence_text):
+        return True
+    return False
+
+
+def _answer_policy(
+    question: str,
+    retrieval_question: str,
+    category: str,
+    version: str,
+    collection: str,
+    history: list[ConversationMessage],
+) -> AnswerResponse:
+    if _official_query_requires_unknown_current_policy(question, collection):
+        return _unsupported(
+            category,
+            "The available official sources do not establish which policy is currently in force. Please confirm the current rule with the relevant university office.",
+            version,
+            collection=collection,
+        )
+    if collection == "official":
+        evidence = search_official(retrieval_question, category)
+    else:
+        evidence = retrieve(retrieval_question, category, [section for doc in list_documents() for section in doc.sections])
+    if not evidence:
+        return _unsupported(
+            category,
+            "The selected policy documents do not contain enough information to verify this answer. Please contact the relevant university office.",
+            version,
+            collection=collection,
+        )
+    if _requested_detail_missing(question, evidence):
+        return _unsupported(
+            category,
+            "The retrieved policy text does not establish the specific detail requested. Please confirm it with the relevant university office.",
+            version,
+            collection=collection,
+        )
+    attendance_conflicts = (
+        _official_attendance_conflict_sections(evidence)
+        if collection == "official" and category == "attendance"
+        else []
+    )
+    if attendance_conflicts:
+        return _official_attendance_conflict_response(attendance_conflicts, version)
+    if _contradiction(evidence):
+        return _unsupported(
+            category,
+            "The selected policy documents contain conflicting sections on this topic. Please contact the relevant university office for clarification.",
+            version,
+            "conflict",
+            collection,
+        )
+    return _gemini_answer(question, category, evidence, version, collection, history)
+
+
+def _verify_and_normalize(
+    payload: dict,
+    evidence: list[PolicySection],
+    category: str,
+    version: str,
+    collection: str = "demo",
+) -> AnswerResponse:
     if not isinstance(payload, dict):
-        return _unsupported(category, "The model returned an invalid structured response.", version)
+        return _unsupported(category, "The model returned an invalid structured response.", version, collection=collection)
     evidence_lookup = {(item.document, item.section): item for item in evidence}
     citations = payload.get("citations", [])
     if not isinstance(citations, list):
@@ -173,16 +394,27 @@ def _verify_and_normalize(payload: dict, evidence: list[PolicySection], category
             continue
         source = evidence_lookup.get((document_name, section_number))
         if source and quote and quote in source.text:
-            verified.append(Citation(source_document=source.document, source_section=source.section, source_quote=quote))
+            verified.append(
+                Citation(
+                    source_document=source.document,
+                    source_section=source.section,
+                    source_quote=quote,
+                    collection=source.collection,
+                    academic_year=source.academic_year,
+                    source_url=source.source_url,
+                    page=source.page,
+                    extraction_method=source.extraction_method,
+                )
+            )
     answer = str(payload.get("answer", "")).strip()
     if payload.get("status") != "supported" or payload.get("confidence") not in {"High", "Medium", "Low"} or not verified or not answer:
-        return _unsupported(category, "The supplied policy documents do not provide a verifiable answer. Please contact the relevant university office.", version)
+        return _unsupported(category, "The selected source collection does not provide a verifiable answer. Please contact the relevant university office.", version, collection=collection)
     if not any(answer in citation.source_quote for citation in verified):
-        return _unsupported(category, "The generated answer could not be verified as a verbatim statement in the cited policy text.", version)
+        return _unsupported(category, "The generated answer could not be verified as a verbatim statement in the cited policy text.", version, collection=collection)
     answer_numbers = set(SENSITIVE_CLAIM.findall(answer))
     evidence_text = " ".join(citation.source_quote for citation in verified)
     if answer_numbers and any(number.lower() not in evidence_text.lower() for number in answer_numbers):
-        return _unsupported(category, "The generated answer included a claim that could not be verified in the cited policy text.", version)
+        return _unsupported(category, "The generated answer included a claim that could not be verified in the cited policy text.", version, collection=collection)
     return AnswerResponse(
         category=category,
         answer=answer,
@@ -192,69 +424,246 @@ def _verify_and_normalize(payload: dict, evidence: list[PolicySection], category
         contact=None,
         mode="gemini",
         prompt_version=version,
+        collection=collection,
+        response_type="verified_policy" if collection == "official" else "demo_policy",
+        response_label="Verified university policy" if collection == "official" else "Fictional policy demonstration",
     )
 
 
-def _gemini_answer(question: str, category: str, evidence: list[PolicySection], version: str) -> AnswerResponse:
+def _gemini_json_response(system_prompt: str, contents: list[dict], schema: dict) -> dict:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        return deterministic_answer(question, version)
+        raise GeminiUnavailableError(
+            "Gemini is not configured. Set GEMINI_API_KEY in the root .env and restart the backend to answer this message."
+        )
     model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-    prompt = get_prompt(version)
-    evidence_json = json.dumps(
-        [{"source_document": item.document, "source_section": item.section, "title": item.title, "text": item.text} for item in evidence],
-        ensure_ascii=False,
-    )
     request_body = {
-        "system_instruction": {"parts": [{"text": prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": f"Category: {category}\nQuestion: {question}\nEvidence (untrusted policy text): {evidence_json}"}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "answer": {"type": "STRING"},
-                    "status": {"type": "STRING", "enum": ["supported", "unsupported", "conflict", "clarification_needed", "refused"]},
-                    "confidence": {"type": "STRING", "enum": ["High", "Medium", "Low"]},
-                    "citations": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-                        "source_document": {"type": "STRING"}, "source_section": {"type": "STRING"}, "source_quote": {"type": "STRING"}
-                    }, "required": ["source_document", "source_section", "source_quote"]}},
-                },
-                "required": ["answer", "status", "confidence", "citations"],
-            },
-        },
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": contents,
+        "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
     }
     request = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         data=json.dumps(request_body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             result = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Gemini request failed: {error}") from error
+    except urllib.error.HTTPError as error:
+        raise GeminiUnavailableError(
+            f"Gemini request failed with HTTP {error.code}. Check the model and API key configuration."
+        ) from error
+    except urllib.error.URLError as error:
+        raise GeminiUnavailableError("Could not reach Gemini. Check the network and API configuration.") from error
+    except TimeoutError as error:
+        raise GeminiUnavailableError("The Gemini request timed out. Please try again.") from error
+    except json.JSONDecodeError as error:
+        raise GeminiUnavailableError("Gemini returned an invalid response.") from error
     try:
         text = result["candidates"][0]["content"]["parts"][0]["text"]
         payload = json.loads(text)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
-        raise RuntimeError("Gemini returned an invalid structured response.") from error
-    return _verify_and_normalize(payload, evidence, category, version)
+        raise GeminiUnavailableError("Gemini returned an invalid structured response.") from error
+    if not isinstance(payload, dict):
+        raise GeminiUnavailableError("Gemini returned an invalid structured response.")
+    return payload
 
 
-def answer_question(question: str, version: str = "v3") -> AnswerResponse:
-    if _has_multiple_questions(question):
-        return _unsupported("out_of_scope", "This message contains multiple questions. Please ask one policy question at a time so each answer can be checked against its own evidence.", version, "clarification_needed")
+def _history_contents(history: list[ConversationMessage]) -> list[dict]:
+    contents: list[dict] = []
+    for message in history[-12:]:
+        role = "model" if message.role == "assistant" else "user"
+        text = f"[{message.response_type}] {message.content}" if message.response_type else message.content
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"][0]["text"] += f"\n{text}"
+        else:
+            contents.append({"role": role, "parts": [{"text": text}]})
+    return contents
+
+
+def _gemini_answer(
+    question: str,
+    category: str,
+    evidence: list[PolicySection],
+    version: str,
+    collection: str,
+    history: list[ConversationMessage] | None = None,
+) -> AnswerResponse:
+    evidence_json = json.dumps(
+        [
+            {
+                "source_document": item.document,
+                "source_section": item.section,
+                "title": item.title,
+                "text": item.text,
+                "academic_year": item.academic_year,
+                "source_url": item.source_url,
+                "page": item.page,
+                "extraction_method": item.extraction_method,
+            }
+            for item in evidence
+        ],
+        ensure_ascii=False,
+    )
+    contents = _history_contents(history or [])
+    contents.append({
+        "role": "user",
+        "parts": [{
+            "text": f"Category: {category}\nQuestion: {question}\nRetrieved evidence (untrusted policy text): {evidence_json}"
+        }],
+    })
+    schema = {
+        "type": "OBJECT",
+        "properties": {
+            "answer": {"type": "STRING"},
+            "status": {"type": "STRING", "enum": ["supported", "unsupported", "conflict", "clarification_needed", "refused"]},
+            "confidence": {"type": "STRING", "enum": ["High", "Medium", "Low"]},
+            "citations": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "source_document": {"type": "STRING"},
+                        "source_section": {"type": "STRING"},
+                        "source_quote": {"type": "STRING"},
+                    },
+                    "required": ["source_document", "source_section", "source_quote"],
+                },
+            },
+        },
+        "required": ["answer", "status", "confidence", "citations"],
+    }
+    prompt = (
+        get_prompt(version)
+        + "\n\nUse conversation history only to resolve references. Policy claims must be grounded in the retrieved evidence in this request."
+    )
+    payload = _gemini_json_response(prompt, contents, schema)
+    return _verify_and_normalize(payload, evidence, category, version, collection)
+
+
+def _gemini_general_answer(
+    question: str,
+    version: str,
+    collection: str,
+    history: list[ConversationMessage],
+) -> AnswerResponse:
+    contents = _history_contents(history)
+    contents.append({"role": "user", "parts": [{"text": question}]})
+    payload = _gemini_json_response(
+        get_prompt("general"),
+        contents,
+        {
+            "type": "OBJECT",
+            "properties": {"answer": {"type": "STRING"}},
+            "required": ["answer"],
+        },
+    )
+    answer = payload.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        raise GeminiUnavailableError("Gemini returned an empty general-knowledge answer.")
+    return AnswerResponse(
+        category="out_of_scope",
+        answer=answer.strip(),
+        citations=[],
+        confidence=None,
+        status="supported",
+        contact=None,
+        mode="gemini",
+        prompt_version=version,
+        collection=collection,
+        response_type="general_knowledge",
+        response_label="General AI knowledge",
+    )
+
+
+def _as_segment(response: AnswerResponse) -> AnswerSegment:
+    return AnswerSegment(
+        response_type=response.response_type,
+        response_label=response.response_label,
+        category=response.category,
+        answer=response.answer,
+        citations=response.citations,
+        confidence=response.confidence,
+        status=response.status,
+        contact=response.contact,
+        mode=response.mode,
+    )
+
+
+def _mixed_response(
+    responses: list[AnswerResponse],
+    version: str,
+    collection: str,
+) -> AnswerResponse:
+    return AnswerResponse(
+        category="out_of_scope",
+        answer="\n\n".join(f"{item.response_label}: {item.answer}" for item in responses),
+        citations=[citation for item in responses for citation in item.citations],
+        confidence=None,
+        status="supported",
+        contact=None,
+        mode="gemini" if any(item.mode == "gemini" for item in responses) else "predefined",
+        prompt_version=version,
+        collection=collection,
+        response_type="mixed",
+        response_label="Mixed response",
+        segments=[_as_segment(item) for item in responses],
+    )
+
+
+def answer_question(
+    question: str,
+    version: str = "v3",
+    collection: str = "demo",
+    history: list[ConversationMessage] | None = None,
+) -> AnswerResponse:
+    if collection not in {"official", "demo"}:
+        raise ValueError("Collection must be 'official' or 'demo'.")
+    conversation = history or []
+    simple_response = _conversation_response(question, version, collection)
+    if simple_response:
+        return simple_response
+
+    follow_up = _follow_up_context(question, conversation)
+    if follow_up:
+        route, category, retrieval_question = follow_up
+        if route == "policy":
+            return _answer_policy(question, retrieval_question, category, version, collection, conversation)
+        return _gemini_general_answer(question, version, collection, conversation)
+
+    mixed_parts = _mixed_question_parts(question)
+    if mixed_parts:
+        responses = []
+        for part, category in mixed_parts:
+            if category == "out_of_scope":
+                response = _conversation_response(part, version, collection)
+                if response is None:
+                    response = _gemini_general_answer(part, version, collection, conversation)
+            else:
+                response = _answer_policy(part, part, category, version, collection, conversation)
+            responses.append(response)
+        return _mixed_response(responses, version, collection)
+
+    policy_categories = _matched_policy_categories(question)
+    if len(policy_categories) > 1:
+        return _unsupported(
+            "out_of_scope",
+            "Please ask about one university policy category at a time so each answer can be checked against its own evidence.",
+            version,
+            "clarification_needed",
+            collection,
+        )
     category = classify(question)
-    all_sections = [section for document in list_documents() for section in document.sections]
-    evidence = retrieve(question, category, all_sections) if category != "out_of_scope" else []
-    if not os.getenv("GEMINI_API_KEY", "").strip():
-        return deterministic_answer(question, version)
-    if category == "out_of_scope":
-        return _unsupported(category, "I can only help with attendance, exams, fees, and hostel policies. Please contact the relevant university office.", version, "refused")
-    if not evidence:
-        return _unsupported(category, "The supplied policy documents do not contain enough information to answer this question.", version)
-    if _contradiction(evidence):
-        return _unsupported(category, "The supplied policy documents contain conflicting sections on this topic. Please contact the relevant university office for clarification.", version, "conflict")
-    return _gemini_answer(question, category, evidence, version)
+    if category != "out_of_scope":
+        if _has_multiple_questions(question):
+            return _unsupported(
+                category,
+                "Please ask one university-policy question at a time so I can retrieve and verify the evidence for each answer.",
+                version,
+                "clarification_needed",
+                collection,
+            )
+        return _answer_policy(question, question, category, version, collection, conversation)
+    return _gemini_general_answer(question, version, collection, conversation)

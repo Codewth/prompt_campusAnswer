@@ -1,16 +1,23 @@
 flowchart TD
-    A[Student question] --> B[Classify: attendance / exams / fees / hostel / out of scope]
-    B --> C{In supported scope?}
-    C -- No --> D[Refuse and suggest relevant support]
-    C -- Yes --> E[Retrieve relevant local policy sections]
-    E --> F{Evidence present and non-conflicting?}
-    F -- No --> G[Uncertainty or conflict response]
-    F -- Yes --> H[Apply selected prompt version]
-    H --> I{Gemini key configured?}
-    I -- No --> J[Deterministic document lookup]
-    I -- Yes --> K[Gemini structured JSON response]
-    J --> L[Verify exact citation and quote]
-    K --> L
-    L --> M{Citation and answer verified?}
-    M -- No --> G
-    M -- Yes --> N[Answer + source + confidence]
+    A[Student message and conversation history] --> B{Greeting, thanks, or introduction?}
+    B -- Yes --> C[Predefined general-conversation reply]
+    B -- No --> D{University-policy intent?}
+    D -- No --> E[Gemini general-knowledge prompt]
+    E --> F{Gemini available?}
+    F -- No --> X[Explicit service-unavailable error]
+    F -- Yes --> G[General AI answer without policy citations]
+    D -- Yes --> H[Classify category and split mixed request]
+    H --> I[Retrieve from selected official or fictional collection]
+    I --> J{Evidence present?}
+    J -- No --> K[Policy information unavailable]
+    J -- Yes --> L{Conflict or requested detail absent?}
+    L -- Conflict --> M[Conflict response with available source excerpts]
+    L -- Detail absent --> K
+    L -- No --> N[Selected V1, V2, or V3 prompt plus evidence]
+    N --> O{Gemini available?}
+    O -- No --> X
+    O -- Yes --> P[Structured Gemini policy response]
+    P --> Q[Verify document, section, exact quote, and answer]
+    Q --> R{All policy claims verified?}
+    R -- No --> K
+    R -- Yes --> S[Verified university policy with citations]

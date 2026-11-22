@@ -1,17 +1,24 @@
 flowchart TB
-    Student[Student / local administrator] --> Browser[React + Vite + Tailwind + Lucide]
-    Browser -->|HTTP JSON / multipart| API[FastAPI + Pydantic]
-    API --> Retriever[Classification and lexical section retrieval]
-    Retriever --> Samples[sample-policies/*.txt]
-    Retriever --> Uploads[backend/documents/ local files]
-    API --> Prompt[Prompt version files]
-    Prompt --> Decision{GEMINI_API_KEY set?}
-    Decision -->|No| Demo[Deterministic demo mode]
-    Decision -->|Yes| Gemini[Gemini API + configured model]
-    Demo --> Verify[Structured response and source verification]
-    Gemini --> Verify
+    Student[Student or allowlisted administrator] --> Web[React and Vite frontend]
+    Web --> Firebase[Firebase Google authentication]
+    Web -->|ID token, JSON, upload| API[FastAPI and Pydantic]
+    API --> Auth[Firebase token verification and local revocation ledger]
+    API --> Profile[UID-linked SQLite profile and theme]
+    API --> Router[Hybrid intent and follow-up router]
+    Router --> Greeting[Predefined conversation replies]
+    Router --> Gemini[Gemini API with configured model]
+    Router --> Retriever[Category-aware retrieval]
+    Retriever --> Official[Official PDF text and local sparse SQLite index]
+    Retriever --> Samples[Fictional sample policy files]
+    Retriever --> Uploads[Admin-allowlisted local uploads]
+    Gemini --> Verify[Structured output and exact-citation verification]
+    Official --> Verify
+    Samples --> Verify
+    Uploads --> Verify
     Verify --> API
-    API --> Browser
-    Tests[Pytest + JSON evaluation runner] --> Retriever
-    Tests --> Verify
-    Tests --> Results[test-data/demo-evaluation-results.json]
+    API --> Web
+    Prompts[V1, V2, V3 prompt files] --> Gemini
+    Cases[18 test inputs] --> Runner[Backend evaluation runner]
+    Runner --> Router
+    Runner --> Exports[JSON, CSV, comparison log, frontend dashboard data]
+    Pytest[Backend regression tests] --> API

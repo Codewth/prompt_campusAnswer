@@ -1,15 +1,22 @@
 flowchart LR
-    Q[Question text] --> API[POST /api/ask]
-    API --> CAT[Category]
-    API --> RET[Retrieved policy sections]
-    CAT --> PROMPT[Selected prompt + evidence]
-    RET --> PROMPT
-    PROMPT --> MODE{Execution mode}
-    MODE -- Gemini configured --> MODEL[Gemini JSON]
-    MODE -- No key --> DEMO[Deterministic lookup]
-    MODEL --> VALIDATE[Validate schema, source, section, exact quote, answer]
-    DEMO --> VALIDATE
-    VALIDATE -->|verified| OUT[Answer with citation and confidence]
-    VALIDATE -->|not verified| GAP[Uncertainty response, no citation]
-    OUT --> UI[Chat UI]
+    U[Question, history, collection, prompt version] --> API[Authenticated POST /api/ask]
+    API --> ROUTE{Message route}
+    ROUTE -- Greeting --> PRE[Predefined reply]
+    ROUTE -- General knowledge --> GEN[Gemini general prompt]
+    ROUTE -- University policy --> RET[Category-specific document retrieval]
+    RET --> EVID{Evidence usable?}
+    EVID -- No --> GAP[Unsupported or clarification response]
+    EVID -- Conflict --> CONFLICT[Conflict response with available sources]
+    EVID -- Yes --> POLICY[Selected prompt and evidence to Gemini]
+    POLICY --> VALIDATE[Validate JSON, source identity, exact quote, grounded answer]
+    VALIDATE -->|Verified| CITED[Supported answer and source citation metadata]
+    VALIDATE -->|Rejected| GAP
+    GEN -->|Available| AI[General AI answer, no policy citations]
+    GEN -->|Unavailable| ERR[Explicit service-unavailable error]
+    POLICY -->|Unavailable| ERR
+    PRE --> UI[Chat UI: response label and content]
+    AI --> UI
+    CITED --> UI
+    CONFLICT --> UI
     GAP --> UI
+    ERR --> UI

@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 
@@ -8,8 +9,12 @@ from .models import PolicyDocument, PolicySection
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SAMPLE_DIR = PROJECT_ROOT / "sample-policies"
-UPLOAD_DIR = PROJECT_ROOT / "backend" / "documents"
+DEFAULT_UPLOAD_DIR = PROJECT_ROOT / "backend" / "documents"
 SECTION_PATTERN = re.compile(r"^##\s+Section\s+([^|]+)\|\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _upload_dir() -> Path:
+    return Path(os.getenv("CAMPUSANSWER_DOCUMENTS_DIR", "").strip() or DEFAULT_UPLOAD_DIR).expanduser()
 
 
 def _read_text(path: Path) -> str:
@@ -36,14 +41,23 @@ def parse_document(path: Path, fictional: bool) -> PolicyDocument:
                     title=match.group(2).strip(),
                     text=text,
                     fictional=fictional,
+                    collection="demo",
+                    source_type="fictional" if fictional else "uploaded",
                 )
             )
-    return PolicyDocument(title=title, filename=path.name, fictional=fictional, sections=sections)
+    return PolicyDocument(
+        title=title,
+        filename=path.name,
+        fictional=fictional,
+        sections=sections,
+        collection="demo",
+        source_type="fictional" if fictional else "uploaded",
+    )
 
 
 def list_documents() -> list[PolicyDocument]:
     docs: list[PolicyDocument] = []
-    for directory, fictional in ((SAMPLE_DIR, True), (UPLOAD_DIR, False)):
+    for directory, fictional in ((SAMPLE_DIR, True), (_upload_dir(), False)):
         if not directory.exists():
             continue
         for path in sorted(directory.iterdir()):
@@ -53,7 +67,8 @@ def list_documents() -> list[PolicyDocument]:
 
 
 def save_upload(filename: str, content: bytes) -> PolicyDocument:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    upload_dir = _upload_dir()
+    upload_dir.mkdir(parents=True, exist_ok=True)
     safe_name = Path(filename).name
     suffix = Path(safe_name).suffix.lower()
     if suffix not in {".txt", ".pdf"}:
@@ -62,7 +77,7 @@ def save_upload(filename: str, content: bytes) -> PolicyDocument:
         raise ValueError("The uploaded file is empty.")
     if len(content) > 5 * 1024 * 1024:
         raise ValueError("Files must be 5 MB or smaller.")
-    destination = UPLOAD_DIR / safe_name
+    destination = upload_dir / safe_name
     if destination.exists():
         raise ValueError("A document with this filename already exists in the local library.")
     destination.write_bytes(content)

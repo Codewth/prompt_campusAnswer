@@ -1,17 +1,25 @@
 flowchart TD
-    A[Local TXT / text PDF] --> B[Parse document and section headings]
-    B --> C[Sections tagged with document, section, title, fictional flag]
-    Q[Question] --> D[Classify supported category]
-    C --> E[Lexical retrieval]
-    D --> E
-    E --> F{Relevant sections found?}
-    F -- No --> U[Unsupported response + office contact]
-    F -- Yes --> G{Same-title conflicting sections?}
-    G -- Yes --> X[Conflict response; no selected rule]
-    G -- No --> H[Prompt / deterministic evidence response]
-    H --> I[Check document and section identity]
-    I --> J[Check exact quote is in source]
-    J --> K[Check answer is contained in verified quote]
-    K --> L{All checks pass?}
-    L -- No --> U
-    L -- Yes --> M[Supported response with source and confidence]
+    A[Official PDFs, fictional samples, or authorized local uploads] --> B[Extract text and section or page metadata]
+    B --> C[Preserve title, section, year/date, source URL, page, extraction method]
+    C --> D[Official: local sparse SQLite index]
+    C --> E[Demo: local fictional policy sections]
+    Q[Question plus conversation context] --> R[Route intent and resolve follow-up]
+    R --> S[Select policy category and source collection]
+    D --> T[Retrieve relevant chunks]
+    E --> T
+    S --> T
+    T --> U{Relevant evidence returned?}
+    U -- No --> V[Unsupported response, no fabricated citation]
+    U -- Yes --> W{Known conflict or requested detail absent?}
+    W -- Conflict --> X[Report conflict and do not select a rule]
+    W -- Detail absent --> V
+    W -- No --> Y[Pass question and retrieved text to selected prompt and Gemini]
+    Y --> Z{Generation available?}
+    Z -- No --> AA[Explicit service-unavailable error]
+    Z -- Yes --> AB[Parse structured response]
+    AB --> AC[Match document and section to retrieved chunks]
+    AC --> AD[Check quote as exact substring]
+    AD --> AE[Check answer and sensitive claims against verified quote]
+    AE --> AF{Checks pass?}
+    AF -- No --> V
+    AF -- Yes --> AG[Answer with verified quote, source link, page, and confidence]
