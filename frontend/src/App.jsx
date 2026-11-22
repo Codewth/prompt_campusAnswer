@@ -504,13 +504,15 @@ function Chat({ history, setHistory, navigate, authorizedFetch }) {
   const [retryRequest, setRetryRequest] = useState(null);
   const [version, setVersion] = useState("v3");
   const [collection, setCollection] = useState("official");
+  const submitLock = useRef(false);
   const scrollRef = useRef(null);
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [history, loading]);
   const submit = async (value = question, retryId = null) => {
     const text = value.trim();
-    if (!text || loading) return;
+    if (!text || loading || submitLock.current) return;
+    submitLock.current = true;
     setQuestion(""); setError(""); setLoading(true);
     if (!retryId) setRetryRequest(null);
     const id = retryId || `${Date.now()}-${Math.random()}`;
@@ -558,6 +560,7 @@ function Chat({ history, setHistory, navigate, authorizedFetch }) {
           : requestError.message || "The assistant could not answer right now.");
     } finally {
       clearTimeout(timeoutId);
+      submitLock.current = false;
       setLoading(false);
     }
   };

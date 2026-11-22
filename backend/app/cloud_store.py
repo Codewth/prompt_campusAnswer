@@ -95,6 +95,32 @@ def table_request(
     )
 
 
+def reserve_gemini_request(daily_limit: int, min_interval_seconds: int) -> str | None:
+    if _settings() is None:
+        return None
+    result = _request(
+        "POST",
+        "/rest/v1/rpc/reserve_gemini_request",
+        json_body={
+            "p_daily_limit": daily_limit,
+            "p_min_interval_seconds": min_interval_seconds,
+        },
+    )
+    if not isinstance(result, str) or result not in {"allowed", "daily_limit", "throttled"}:
+        raise CloudStoreError("Supabase returned an invalid Gemini quota reservation.")
+    return result
+
+
+def mark_gemini_quota_exhausted(daily_limit: int) -> None:
+    if _settings() is None:
+        return
+    _request(
+        "POST",
+        "/rest/v1/rpc/mark_gemini_quota_exhausted",
+        json_body={"p_daily_limit": daily_limit},
+    )
+
+
 def _bucket() -> str:
     return quote(os.getenv("SUPABASE_STORAGE_BUCKET", "campusanswer-documents").strip(), safe="")
 

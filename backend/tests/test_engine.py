@@ -1,5 +1,7 @@
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import httpx
 import pytest
@@ -10,8 +12,22 @@ import jwt
 from app import auth, engine, main
 from app.engine import GeminiUnavailableError, _verify_and_normalize, answer_question, classify
 from app.main import _cors_origins, app
-from app.models import ConversationMessage, PolicyDocument, PolicySection
+from app.models import AnswerResponse, ConversationMessage, PolicyDocument, PolicySection
 from app.policies import list_documents, save_upload
+
+
+@pytest.fixture(autouse=True)
+def isolate_gemini_state(monkeypatch):
+    with engine._GEMINI_CACHE_LOCK:
+        engine._GEMINI_CACHE.clear()
+        engine._GEMINI_IN_FLIGHT.clear()
+    with engine._LOCAL_GEMINI_QUOTA_LOCK:
+        engine._LOCAL_GEMINI_QUOTA_DATE = time.strftime("%Y-%m-%d")
+        engine._LOCAL_GEMINI_REQUEST_COUNT = 0
+        engine._LOCAL_GEMINI_LAST_REQUEST = 0.0
+        engine._LOCAL_GEMINI_QUOTA_EXHAUSTED = False
+    monkeypatch.setattr(engine, "reserve_gemini_request", lambda *_args: "allowed")
+    monkeypatch.setattr(engine, "mark_gemini_quota_exhausted", lambda _limit: None)
 
 
 def _mock_policy_generation(question, category, evidence, version, collection, history):
@@ -61,6 +77,7 @@ def test_supported_answer_has_exact_source_quote(monkeypatch):
 
 def test_missing_policy_evidence_does_not_make_up_citations(monkeypatch):
     monkeypatch.setattr(engine, "retrieve", lambda question, category, sections: [])
+    monkeypatch.setattr(engine, "_gemini_answer", lambda *args, **kwargs: pytest.fail("No-evidence policy request must not call Gemini"))
     missing = answer_question("What is the attendance penalty for late arrivals?")
     assert missing.status == "unsupported"
     assert missing.response_type == "policy_unavailable"
@@ -91,16 +108,117 @@ def test_general_answer_uses_gemini_and_has_no_policy_citations(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
     monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
     response = answer_question("Explain RAG")
+    cached_response = answer_question("Explain RAG")
 
     assert response.response_type == "general_knowledge"
     assert response.response_label == "General AI knowledge"
     assert response.mode == "gemini"
     assert response.citations == [] and response.confidence is None
     assert len(requests) == 1
+    assert cached_response.answer == response.answer
     assert requests[0][1]["headers"]["x-goog-api-key"] == "test-key-not-real"
     assert "test-key-not-real" not in requests[0][0]
     assert requests[0][0].endswith("/models/gemini-3.8-flash:generateContent")
     assert requests[0][1]["json"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
+
+
+def test_personal_general_questions_are_not_cached(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    requests = []
+
+    def fake_post(url, **kwargs):
+        requests.append(url)
+        answer = f"answer-{len(requests)}"
+        return httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": json.dumps({"answer": answer})}]}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
+    first = answer_question("What is my course standing?")
+    second = answer_question("What is my course standing?")
+    assert first.answer == "answer-1"
+    assert second.answer == "answer-2"
+    assert len(requests) == 2
+
+
+def test_time_sensitive_general_questions_are_not_cached():
+    assert engine._gemini_answer_cache_key(
+        "general", "Who is the current prime minister?", "v3", "official", []
+    ) is None
+    assert engine._gemini_answer_cache_key(
+        "general", "What is the weather today?", "v3", "official", []
+    ) is None
+
+
+def test_concurrent_identical_questions_share_one_generation():
+    generation_started = Event()
+    release_generation = Event()
+    calls = []
+
+    def generate():
+        calls.append("generated")
+        generation_started.set()
+        assert release_generation.wait(timeout=2)
+        return AnswerResponse(
+            category="out_of_scope",
+            answer="A grounded general answer.",
+            status="supported",
+            mode="gemini",
+            prompt_version="v3",
+            collection="official",
+            response_type="general_knowledge",
+            response_label="General AI knowledge",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(engine._cached_gemini_answer, "same-question", generate)
+        assert generation_started.wait(timeout=1)
+        second = executor.submit(engine._cached_gemini_answer, "same-question", generate)
+        release_generation.set()
+        assert first.result(timeout=2).answer == "A grounded general answer."
+        assert second.result(timeout=2).answer == "A grounded general answer."
+    assert calls == ["generated"]
+
+
+def test_official_policy_answer_cache_is_keyed_by_retrieved_evidence(monkeypatch):
+    evidence = PolicySection(
+        document="Official Exam Rules",
+        section="1.1",
+        title="Examination registration",
+        text="Students must register before the examination period begins.",
+        fictional=False,
+        collection="official",
+        source_type="official",
+    )
+    monkeypatch.setattr(engine, "search_official", lambda *args, **kwargs: [evidence])
+    generated = []
+
+    def fake_json_response(*args, **kwargs):
+        generated.append(evidence.text)
+        return {
+            "answer": evidence.text,
+            "status": "supported",
+            "confidence": "High",
+            "citations": [{
+                "source_document": evidence.document,
+                "source_section": evidence.section,
+                "source_quote": evidence.text,
+            }],
+        }
+
+    monkeypatch.setattr(engine, "_gemini_json_response", fake_json_response)
+    first = answer_question("What is an examination rule?", collection="official")
+    second = answer_question("What is an examination rule?", collection="official")
+    assert first.response_type == "verified_policy"
+    assert second.citations[0].source_quote == evidence.text
+    assert generated == [evidence.text]
+
+    evidence.text = "Students must complete examination registration before the published deadline."
+    third = answer_question("What is an examination rule?", collection="official")
+    assert third.citations[0].source_quote == evidence.text
+    assert len(generated) == 2
 
 
 def test_plain_gemini_request_omits_json_schema(monkeypatch):
@@ -130,7 +248,7 @@ def test_plain_gemini_request_omits_json_schema(monkeypatch):
 @pytest.mark.parametrize(
     ("status_code", "provider_status", "expected_status", "message"),
     [
-        (429, "RESOURCE_EXHAUSTED", 429, "rate limit"),
+        (429, "RESOURCE_EXHAUSTED", 429, "free-tier quota is exhausted"),
         (503, "UNAVAILABLE", 503, "temporarily unavailable"),
         (404, "NOT_FOUND", 502, "was not found"),
     ],
@@ -152,7 +270,7 @@ def test_gemini_upstream_errors_are_classified(monkeypatch, status_code, provide
     with pytest.raises(GeminiUnavailableError, match=message) as error:
         engine._gemini_json_response("prompt", [], {})
     assert error.value.status_code == expected_status
-    assert len(requests) == (2 if status_code == 503 else 1)
+    assert len(requests) == 1
 
 
 def test_gemini_network_timeout_has_gateway_timeout_status(monkeypatch):
@@ -170,73 +288,60 @@ def test_gemini_network_timeout_has_gateway_timeout_status(monkeypatch):
     assert len(requests) == 1
 
 
-def test_gemini_connect_timeout_retries_once(monkeypatch):
+def test_gemini_connect_timeout_is_not_retried(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
-    monkeypatch.setattr(engine.time, "sleep", lambda _: None)
-    responses = [
-        httpx.ConnectTimeout("connection timed out"),
-        httpx.Response(
-            200,
-            json={"candidates": [{"content": {"parts": [{"text": '{"answer":"OK"}'}]}}]},
-            request=httpx.Request("POST", "https://example.test"),
-        ),
-    ]
     calls = []
 
     def fake_post(url, **kwargs):
         calls.append(url)
-        result = responses.pop(0)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
-    assert engine._gemini_json_response("prompt", [], {}) == {"answer": "OK"}
-    assert len(calls) == 2
-
-
-def test_gemini_503_retry_is_bounded_to_one(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
-    monkeypatch.setattr(engine.time, "sleep", lambda _: None)
-    requests = []
-
-    def fake_post(url, **kwargs):
-        requests.append(url)
-        return httpx.Response(
-            503,
-            json={"error": {"status": "UNAVAILABLE", "message": "busy"}},
-            request=httpx.Request("POST", url),
-        )
+        raise httpx.ConnectTimeout("connection timed out")
 
     monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
     with pytest.raises(GeminiUnavailableError) as error:
         engine._gemini_json_response("prompt", [], {})
-    assert error.value.status_code == 503
-    assert len(requests) == 2
+    assert error.value.status_code == 504
+    assert len(calls) == 1
 
 
-def test_gemini_503_retry_can_recover(monkeypatch):
+def test_gemini_429_closes_daily_budget_without_retry(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
-    monkeypatch.setattr(engine.time, "sleep", lambda _: None)
-    responses = [
-        httpx.Response(
-            503,
-            json={"error": {"status": "UNAVAILABLE", "message": "busy"}},
-            request=httpx.Request("POST", "https://example.test"),
-        ),
-        httpx.Response(
-            200,
-            json={"candidates": [{"content": {"parts": [{"text": '{"answer":"OK"}'}]}}]},
-            request=httpx.Request("POST", "https://example.test"),
-        ),
-    ]
+    requests = []
+    quota_breakers = []
 
     def fake_post(url, **kwargs):
-        return responses.pop(0)
+        requests.append(url)
+        return httpx.Response(
+            429,
+            json={"error": {"status": "RESOURCE_EXHAUSTED", "message": "quota exhausted"}},
+            request=httpx.Request("POST", url),
+        )
 
     monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", fake_post)
-    assert engine._gemini_json_response("prompt", [], {}) == {"answer": "OK"}
-    assert responses == []
+    monkeypatch.setattr(engine, "mark_gemini_quota_exhausted", quota_breakers.append)
+    with pytest.raises(GeminiUnavailableError) as error:
+        engine._gemini_json_response("prompt", [], {})
+    assert error.value.status_code == 429
+    assert len(requests) == 1
+    assert quota_breakers == [engine.GEMINI_DAILY_REQUEST_LIMIT]
+
+
+@pytest.mark.parametrize(
+    ("reservation", "message"),
+    [
+        ("daily_limit", "daily Gemini free-tier budget"),
+        ("throttled", "wait a few seconds"),
+    ],
+)
+def test_quota_guard_prevents_provider_request(monkeypatch, reservation, message):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(engine, "reserve_gemini_request", lambda *_args: reservation)
+    requests = []
+    monkeypatch.setattr(engine.GEMINI_HTTP_CLIENT, "post", lambda *args, **kwargs: requests.append(args))
+
+    with pytest.raises(GeminiUnavailableError, match=message) as error:
+        engine._gemini_json_response("prompt", [], {})
+    assert error.value.status_code == 429
+    assert requests == []
 
 
 def test_general_follow_up_includes_prior_turn_as_context(monkeypatch):

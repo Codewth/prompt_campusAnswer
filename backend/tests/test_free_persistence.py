@@ -173,6 +173,42 @@ def test_supabase_storage_listing_and_download_preserve_file_bytes(monkeypatch):
     assert calls[2][2]["data"] == content
 
 
+@pytest.mark.parametrize(
+    ("reservation", "expected"),
+    [("allowed", "allowed"), ("daily_limit", "daily_limit"), ("throttled", "throttled")],
+)
+def test_gemini_quota_reservation_uses_shared_supabase_rpc(monkeypatch, reservation, expected):
+    _set_supabase(monkeypatch)
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse(reservation)
+
+    monkeypatch.setattr(cloud_store.requests, "request", fake_request)
+    assert cloud_store.reserve_gemini_request(20, 2) == expected
+    assert calls[0][0] == "POST"
+    assert calls[0][1].endswith("/rest/v1/rpc/reserve_gemini_request")
+    assert calls[0][2]["json"] == {
+        "p_daily_limit": 20,
+        "p_min_interval_seconds": 2,
+    }
+
+
+def test_gemini_provider_quota_exhaustion_is_persisted(monkeypatch):
+    _set_supabase(monkeypatch)
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse(status_code=204)
+
+    monkeypatch.setattr(cloud_store.requests, "request", fake_request)
+    cloud_store.mark_gemini_quota_exhausted(20)
+    assert calls[0][1].endswith("/rest/v1/rpc/mark_gemini_quota_exhausted")
+    assert calls[0][2]["json"] == {"p_daily_limit": 20}
+
+
 def test_duplicate_cloud_upload_returns_validation_error(monkeypatch):
     _set_supabase(monkeypatch)
     monkeypatch.setattr(policies, "list_uploaded_documents", lambda: [])

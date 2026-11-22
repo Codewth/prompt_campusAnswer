@@ -1,13 +1,18 @@
+import hashlib
 import json
 import logging
 import os
 import re
 import time
+from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
+from threading import Event, Lock
 
 import httpx
 from dotenv import load_dotenv
 
+from .cloud_store import CloudStoreError, mark_gemini_quota_exhausted, reserve_gemini_request
 from .models import AnswerResponse, AnswerSegment, Citation, ConversationMessage, PolicySection
 from .official_index import search_official
 from .policies import list_documents
@@ -71,12 +76,27 @@ logger = logging.getLogger(__name__)
 GEMINI_MODEL_DEFAULT = "gemini-3.8-flash"
 GEMINI_CONNECT_TIMEOUT_SECONDS = 5
 GEMINI_READ_TIMEOUT_SECONDS = 45
-GEMINI_MAX_RETRIES = 1
-GEMINI_RETRY_BACKOFF_SECONDS = 0.5
+GEMINI_DAILY_REQUEST_LIMIT = int(os.getenv("GEMINI_DAILY_REQUEST_LIMIT", "20"))
+GEMINI_MIN_REQUEST_INTERVAL_SECONDS = 2
+GEMINI_CACHE_TTL_SECONDS = 30 * 60
+GEMINI_CACHE_MAX_ENTRIES = 128
 MAX_POLICY_EVIDENCE_CHUNKS = 5
 MAX_POLICY_EVIDENCE_CHARS = 12_000
 MAX_HISTORY_MESSAGES = 8
 MAX_HISTORY_MESSAGE_CHARS = 1_200
+NON_PERSONAL_CACHE_EXCLUSIONS = re.compile(
+    r"\b(?:i|me|my|mine|myself|we|us|our|ours|you|your|yours|yourself|"
+    r"student id|student number|enrollment number|roll number|my profile|my account|"
+    r"email|phone number|mobile number|gpa|cgpa)\b"
+    r"|[\w.+-]+@[\w.-]+\.[A-Z]{2,}"
+    r"|\b(?:s\d{2}cseu\d{4}|\+?\d[\d ()-]{8,}\d)\b",
+    re.I,
+)
+CACHE_VOLATILE_QUERY = re.compile(
+    r"\b(?:current|currently|today|yesterday|tomorrow|now|latest|recent|"
+    r"this week|this month|this year|weather|stock price|exchange rate|score)\b",
+    re.I,
+)
 GEMINI_HTTP_CLIENT = httpx.Client(
     timeout=httpx.Timeout(
         connect=GEMINI_CONNECT_TIMEOUT_SECONDS,
@@ -85,6 +105,14 @@ GEMINI_HTTP_CLIENT = httpx.Client(
         pool=5,
     )
 )
+_GEMINI_CACHE: OrderedDict[str, tuple[float, AnswerResponse]] = OrderedDict()
+_GEMINI_IN_FLIGHT: dict[str, Event] = {}
+_GEMINI_CACHE_LOCK = Lock()
+_LOCAL_GEMINI_QUOTA_LOCK = Lock()
+_LOCAL_GEMINI_QUOTA_DATE = ""
+_LOCAL_GEMINI_REQUEST_COUNT = 0
+_LOCAL_GEMINI_LAST_REQUEST = 0.0
+_LOCAL_GEMINI_QUOTA_EXHAUSTED = False
 
 
 class GeminiUnavailableError(RuntimeError):
@@ -94,8 +122,8 @@ class GeminiUnavailableError(RuntimeError):
 
 
 class GeminiRateLimitError(GeminiUnavailableError):
-    def __init__(self):
-        super().__init__("Gemini rate limit reached. Wait a little, then retry.", status_code=429)
+    def __init__(self, message: str = "Gemini's free-tier quota has been reached. No automatic retry was sent."):
+        super().__init__(message, status_code=429)
 
 
 class GeminiServiceUnavailableError(GeminiUnavailableError):
@@ -113,6 +141,166 @@ def gemini_runtime_status() -> dict[str, str | bool]:
         "configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
         "model": os.getenv("GEMINI_MODEL", GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT,
     }
+
+
+def _cacheable_question(question: str, history: list[ConversationMessage] | None) -> bool:
+    normalized = question.strip()
+    return (
+        not history
+        and 0 < len(normalized) <= 300
+        and NON_PERSONAL_CACHE_EXCLUSIONS.search(normalized) is None
+        and CACHE_VOLATILE_QUERY.search(normalized) is None
+    )
+
+
+def _gemini_answer_cache_key(
+    kind: str,
+    question: str,
+    version: str,
+    collection: str,
+    history: list[ConversationMessage] | None,
+    category: str | None = None,
+    evidence: str = "",
+) -> str | None:
+    if not _cacheable_question(question, history):
+        return None
+    key_data = {
+        "kind": kind,
+        "model": os.getenv("GEMINI_MODEL", GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT,
+        "question": re.sub(r"\s+", " ", question).strip().casefold(),
+        "version": version,
+        "collection": collection,
+        "category": category,
+        "evidence": hashlib.sha256(evidence.encode("utf-8")).hexdigest() if evidence else "",
+    }
+    return hashlib.sha256(json.dumps(key_data, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _cached_gemini_answer(
+    cache_key: str | None,
+    generate: Callable[[], AnswerResponse],
+) -> AnswerResponse:
+    if cache_key is None:
+        return generate()
+
+    now = time.monotonic()
+    with _GEMINI_CACHE_LOCK:
+        cached = _GEMINI_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            _GEMINI_CACHE.move_to_end(cache_key)
+            return cached[1].model_copy(deep=True)
+        if cached:
+            del _GEMINI_CACHE[cache_key]
+
+        pending = _GEMINI_IN_FLIGHT.get(cache_key)
+        is_owner = pending is None
+        if pending is None:
+            pending = Event()
+            _GEMINI_IN_FLIGHT[cache_key] = pending
+
+    if not is_owner:
+        if not pending.wait(GEMINI_CONNECT_TIMEOUT_SECONDS + GEMINI_READ_TIMEOUT_SECONDS + 10):
+            raise GeminiUnavailableError(
+                "The same question is still being processed. Wait before submitting it again.",
+                status_code=429,
+            )
+        with _GEMINI_CACHE_LOCK:
+            cached = _GEMINI_CACHE.get(cache_key)
+            if cached and cached[0] > time.monotonic():
+                _GEMINI_CACHE.move_to_end(cache_key)
+                return cached[1].model_copy(deep=True)
+        raise GeminiUnavailableError(
+            "The previous identical request did not complete. Please wait before trying again.",
+            status_code=503,
+        )
+
+    try:
+        response = generate()
+        with _GEMINI_CACHE_LOCK:
+            _GEMINI_CACHE[cache_key] = (
+                time.monotonic() + GEMINI_CACHE_TTL_SECONDS,
+                response.model_copy(deep=True),
+            )
+            _GEMINI_CACHE.move_to_end(cache_key)
+            while len(_GEMINI_CACHE) > GEMINI_CACHE_MAX_ENTRIES:
+                _GEMINI_CACHE.popitem(last=False)
+        return response
+    finally:
+        with _GEMINI_CACHE_LOCK:
+            if _GEMINI_IN_FLIGHT.get(cache_key) is pending:
+                del _GEMINI_IN_FLIGHT[cache_key]
+            pending.set()
+
+
+def _reserve_local_gemini_request() -> str:
+    global _LOCAL_GEMINI_QUOTA_DATE
+    global _LOCAL_GEMINI_REQUEST_COUNT
+    global _LOCAL_GEMINI_LAST_REQUEST
+    global _LOCAL_GEMINI_QUOTA_EXHAUSTED
+
+    today = time.strftime("%Y-%m-%d")
+    now = time.monotonic()
+    with _LOCAL_GEMINI_QUOTA_LOCK:
+        if today != _LOCAL_GEMINI_QUOTA_DATE:
+            _LOCAL_GEMINI_QUOTA_DATE = today
+            _LOCAL_GEMINI_REQUEST_COUNT = 0
+            _LOCAL_GEMINI_LAST_REQUEST = 0.0
+            _LOCAL_GEMINI_QUOTA_EXHAUSTED = False
+        if _LOCAL_GEMINI_QUOTA_EXHAUSTED or _LOCAL_GEMINI_REQUEST_COUNT >= GEMINI_DAILY_REQUEST_LIMIT:
+            return "daily_limit"
+        if (
+            _LOCAL_GEMINI_LAST_REQUEST
+            and now - _LOCAL_GEMINI_LAST_REQUEST < GEMINI_MIN_REQUEST_INTERVAL_SECONDS
+        ):
+            return "throttled"
+        _LOCAL_GEMINI_REQUEST_COUNT += 1
+        _LOCAL_GEMINI_LAST_REQUEST = now
+        return "allowed"
+
+
+def _reserve_gemini_request() -> None:
+    try:
+        reservation = reserve_gemini_request(
+            GEMINI_DAILY_REQUEST_LIMIT,
+            GEMINI_MIN_REQUEST_INTERVAL_SECONDS,
+        )
+    except CloudStoreError as error:
+        raise GeminiUnavailableError(
+            "CampusAnswer could not verify its Gemini daily budget, so it did not send an AI request.",
+            status_code=503,
+        ) from error
+
+    if reservation is None:
+        reservation = _reserve_local_gemini_request()
+    if reservation == "daily_limit":
+        raise GeminiRateLimitError(
+            "CampusAnswer has reached its daily Gemini free-tier budget. AI requests are paused until the quota day resets."
+        )
+    if reservation == "throttled":
+        raise GeminiRateLimitError(
+            "Please wait a few seconds before sending another AI question."
+        )
+    if reservation != "allowed":
+        raise GeminiUnavailableError(
+            "CampusAnswer could not reserve Gemini quota, so it did not send an AI request.",
+            status_code=503,
+        )
+
+
+def _mark_gemini_quota_exhausted() -> None:
+    global _LOCAL_GEMINI_QUOTA_EXHAUSTED
+    global _LOCAL_GEMINI_REQUEST_COUNT
+    with _LOCAL_GEMINI_QUOTA_LOCK:
+        _LOCAL_GEMINI_QUOTA_EXHAUSTED = True
+        _LOCAL_GEMINI_REQUEST_COUNT = GEMINI_DAILY_REQUEST_LIMIT
+    try:
+        mark_gemini_quota_exhausted(GEMINI_DAILY_REQUEST_LIMIT)
+    except CloudStoreError as error:
+        logger.error(
+            "Could not persist Gemini quota circuit breaker error_type=%s",
+            type(error).__name__,
+            exc_info=True,
+        )
 
 
 def classify(question: str) -> str:
@@ -519,77 +707,35 @@ def _gemini_generate_text(
     }
     if generation_config is not None:
         request_body["generationConfig"] = generation_config
+    _reserve_gemini_request()
     started = time.perf_counter()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    response = None
-    for attempt in range(GEMINI_MAX_RETRIES + 1):
-        try:
-            response = GEMINI_HTTP_CLIENT.post(
-                url,
-                json=request_body,
-                headers={"x-goog-api-key": api_key},
-            )
-        except (httpx.ConnectTimeout, httpx.ConnectError) as error:
-            retrying = attempt < GEMINI_MAX_RETRIES
-            logger.warning(
-                "Gemini connection failure model=%s phase=%s attempt=%d elapsed_ms=%d retry=%s",
-                model,
-                type(error).__name__,
-                attempt + 1,
-                round((time.perf_counter() - started) * 1000),
-                retrying,
-            )
-            if retrying:
-                time.sleep(GEMINI_RETRY_BACKOFF_SECONDS)
-                continue
-            if isinstance(error, httpx.ConnectTimeout):
-                raise GeminiTimeoutError() from error
-            raise GeminiUnavailableError(
-                "Could not connect to Gemini. Check the backend network and try again.",
-                status_code=502,
-            ) from error
-        except httpx.ReadTimeout as error:
-            logger.warning(
-                "Gemini network timeout model=%s phase=ReadTimeout attempt=%d elapsed_ms=%d retry=false reason=avoid_duplicate_generation",
-                model,
-                attempt + 1,
-                round((time.perf_counter() - started) * 1000),
-            )
-            raise GeminiTimeoutError() from error
-        except httpx.TimeoutException as error:
-            logger.warning(
-                "Gemini network timeout model=%s phase=%s attempt=%d elapsed_ms=%d retry=false",
-                model,
-                type(error).__name__,
-                attempt + 1,
-                round((time.perf_counter() - started) * 1000),
-            )
-            raise GeminiTimeoutError() from error
-        except httpx.RequestError as error:
-            logger.warning(
-                "Gemini network request failed model=%s error_type=%s attempt=%d elapsed_ms=%d",
-                model,
-                type(error).__name__,
-                attempt + 1,
-                round((time.perf_counter() - started) * 1000),
-            )
-            raise GeminiUnavailableError(
-                "Could not reach Gemini. Check the backend network and try again.",
-                status_code=502,
-            ) from error
+    try:
+        response = GEMINI_HTTP_CLIENT.post(
+            url,
+            json=request_body,
+            headers={"x-goog-api-key": api_key},
+        )
+    except httpx.TimeoutException as error:
+        logger.warning(
+            "Gemini network timeout model=%s phase=%s elapsed_ms=%d retry=false",
+            model,
+            type(error).__name__,
+            round((time.perf_counter() - started) * 1000),
+        )
+        raise GeminiTimeoutError() from error
+    except httpx.RequestError as error:
+        logger.warning(
+            "Gemini network request failed model=%s error_type=%s elapsed_ms=%d",
+            model,
+            type(error).__name__,
+            round((time.perf_counter() - started) * 1000),
+        )
+        raise GeminiUnavailableError(
+            "Could not reach Gemini. Check the backend network and try again.",
+            status_code=502,
+        ) from error
 
-        if response.status_code == 503 and attempt < GEMINI_MAX_RETRIES:
-            logger.warning(
-                "Gemini transient upstream error model=%s http_status=503 attempt=%d retry=true elapsed_ms=%d",
-                model,
-                attempt + 1,
-                round((time.perf_counter() - started) * 1000),
-            )
-            time.sleep(GEMINI_RETRY_BACKOFF_SECONDS)
-            continue
-        break
-
-    assert response is not None
     elapsed_ms = round((time.perf_counter() - started) * 1000)
     if response.status_code >= 400:
         try:
@@ -611,7 +757,10 @@ def _gemini_generate_text(
             provider_message[:300],
         )
         if response.status_code == 429:
-            raise GeminiRateLimitError()
+            _mark_gemini_quota_exhausted()
+            raise GeminiRateLimitError(
+                "Gemini reports that its free-tier quota is exhausted. Further AI requests are paused until the quota day resets; this request was not retried."
+            )
         if response.status_code == 503 or response.status_code >= 500:
             raise GeminiServiceUnavailableError()
         if response.status_code == 404:
@@ -739,8 +888,25 @@ def _gemini_answer(
         get_prompt(version)
         + "\n\nUse conversation history only to resolve references. Policy claims must be grounded in the retrieved evidence in this request."
     )
-    payload = _gemini_json_response(prompt, contents, schema)
-    return _verify_and_normalize(payload, evidence, category, version, collection)
+    cache_key = (
+        _gemini_answer_cache_key(
+            "policy",
+            question,
+            version,
+            collection,
+            history,
+            category=category,
+            evidence=evidence_json,
+        )
+        if collection == "official"
+        else None
+    )
+
+    def generate() -> AnswerResponse:
+        payload = _gemini_json_response(prompt, contents, schema)
+        return _verify_and_normalize(payload, evidence, category, version, collection)
+
+    return _cached_gemini_answer(cache_key, generate)
 
 
 def _gemini_general_answer(
@@ -749,33 +915,44 @@ def _gemini_general_answer(
     collection: str,
     history: list[ConversationMessage],
 ) -> AnswerResponse:
-    contents = _history_contents(history)
-    contents.append({"role": "user", "parts": [{"text": question}]})
-    payload = _gemini_json_response(
-        get_prompt("general"),
-        contents,
-        {
-            "type": "OBJECT",
-            "properties": {"answer": {"type": "STRING"}},
-            "required": ["answer"],
-        },
+    cache_key = _gemini_answer_cache_key(
+        "general",
+        question,
+        version,
+        collection,
+        history,
     )
-    answer = payload.get("answer")
-    if not isinstance(answer, str) or not answer.strip():
-        raise GeminiUnavailableError("Gemini returned an empty general-knowledge answer.")
-    return AnswerResponse(
-        category="out_of_scope",
-        answer=answer.strip(),
-        citations=[],
-        confidence=None,
-        status="supported",
-        contact=None,
-        mode="gemini",
-        prompt_version=version,
-        collection=collection,
-        response_type="general_knowledge",
-        response_label="General AI knowledge",
-    )
+
+    def generate() -> AnswerResponse:
+        contents = _history_contents(history)
+        contents.append({"role": "user", "parts": [{"text": question}]})
+        payload = _gemini_json_response(
+            get_prompt("general"),
+            contents,
+            {
+                "type": "OBJECT",
+                "properties": {"answer": {"type": "STRING"}},
+                "required": ["answer"],
+            },
+        )
+        answer = payload.get("answer")
+        if not isinstance(answer, str) or not answer.strip():
+            raise GeminiUnavailableError("Gemini returned an empty general-knowledge answer.")
+        return AnswerResponse(
+            category="out_of_scope",
+            answer=answer.strip(),
+            citations=[],
+            confidence=None,
+            status="supported",
+            contact=None,
+            mode="gemini",
+            prompt_version=version,
+            collection=collection,
+            response_type="general_knowledge",
+            response_label="General AI knowledge",
+        )
+
+    return _cached_gemini_answer(cache_key, generate)
 
 
 def _as_segment(response: AnswerResponse) -> AnswerSegment:
