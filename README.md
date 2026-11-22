@@ -177,6 +177,14 @@ Individual contributions are not inferred. Fill the placeholders in `docs/milest
 
 ## Render and Vercel deployment
 
+Live deployment:
+
+- Frontend: https://prompt-campus-answer.vercel.app
+- Backend: https://prompt-campusanswer.onrender.com
+- Health: https://prompt-campusanswer.onrender.com/api/health
+- The frontend uses Vite environment variables and connects directly to the Render backend.
+- The Render service is configured on the Free plan with Supabase Free persistence.
+
 Deployment configuration is included but does not contain credentials:
 
 - `render.yaml` defines a Docker FastAPI service on Render's **Free** instance type. It deliberately has no Render disk or paid database. Render Free filesystems are ephemeral, so the app requires Supabase configuration before its health check succeeds.
