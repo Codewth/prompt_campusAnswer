@@ -1,9 +1,11 @@
 import os
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+from .cloud_store import supabase_is_configured, table_request
 from .models import ProfileUpdate
 from .revocations import DEFAULT_DATABASE
 
@@ -52,18 +54,45 @@ def _connect() -> sqlite3.Connection:
     return connection
 
 
+def _cloud_profile(uid: str) -> dict | None:
+    rows = table_request(
+        "GET",
+        "student_profiles",
+        params={"select": "*", "uid": f"eq.{uid}", "limit": "1"},
+    )
+    if not isinstance(rows, list):
+        raise RuntimeError("Supabase returned an invalid student-profile response.")
+    return dict(rows[0]) if rows else None
+
+
+def _cloud_upsert(payload: dict) -> dict:
+    rows = table_request(
+        "POST",
+        "student_profiles",
+        params={"on_conflict": "uid"},
+        json_body=payload,
+        headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+    )
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        raise RuntimeError("Supabase did not return the saved student profile.")
+    return dict(rows[0])
+
+
 def get_profile(
     uid: str,
     email: str | None,
     photo_url: str | None,
     identity_name: str | None,
 ) -> dict:
-    with closing(_connect()) as connection:
-        row = connection.execute(
-            "SELECT * FROM student_profiles WHERE uid = ?",
-            (uid,),
-        ).fetchone()
-    saved = dict(row) if row else {}
+    if supabase_is_configured():
+        saved = _cloud_profile(uid) or {}
+    else:
+        with closing(_connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM student_profiles WHERE uid = ?",
+                (uid,),
+            ).fetchone()
+        saved = dict(row) if row else {}
     return {
         "uid": uid,
         "name": saved.get("name") or identity_name,
@@ -82,6 +111,23 @@ def save_profile(
     photo_url: str | None,
 ) -> dict:
     values = update.model_dump()
+    if supabase_is_configured():
+        saved = _cloud_upsert(
+            {
+                "uid": uid,
+                **values,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return {
+            "uid": uid,
+            "name": saved["name"],
+            "email": email,
+            "photo_url": photo_url,
+            **{field: saved[field] for field in PROFILE_FIELDS if field != "name"},
+            "theme": saved["theme"],
+            "updated_at": saved["updated_at"],
+        }
     with closing(_connect()) as connection:
         with connection:
             connection.execute(
@@ -127,6 +173,24 @@ def save_theme(
     photo_url: str | None,
     identity_name: str | None,
 ) -> dict:
+    if supabase_is_configured():
+        payload = {
+            "uid": uid,
+            "theme": theme,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if _cloud_profile(uid) is None:
+            payload["name"] = identity_name or ""
+        saved = _cloud_upsert(payload)
+        return {
+            "uid": uid,
+            "name": saved["name"] or identity_name,
+            "email": email,
+            "photo_url": photo_url,
+            **{field: saved.get(field, "") for field in PROFILE_FIELDS if field != "name"},
+            "theme": saved["theme"],
+            "updated_at": saved["updated_at"],
+        }
     with closing(_connect()) as connection:
         with connection:
             connection.execute(

@@ -10,4 +10,6 @@
 - Added 18 evaluation inputs, three versioned policy prompts, JSON/CSV outputs, and a prompt-comparison summary that distinguishes blocked Gemini runs.
 - Added citation verification and explicit handling for missing evidence, out-of-scope questions, multi-question requests, and contradictory sample sections.
 - Added authenticated student profiles, per-user SQLite persistence, editable academic details, and saved light/dark theme preferences.
+- Added optional Supabase PostgREST and private Storage persistence for free Render deployments, with cloud-backed profile/session state and uploaded policy files.
+- Switched Render Blueprint configuration to Free with no disk or paid database; production health now requires cloud persistence, and one Uvicorn worker plus bounded document caching keeps memory use predictable.
 - Updated Milestone 2 reports and Mermaid diagrams to describe the actual hybrid routing and recorded evaluation limitations.

@@ -1,17 +1,29 @@
 import os
+import logging
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from .auth import AuthenticatedUser, require_admin, require_user, revoke_firebase_refresh_tokens
+from .cloud_store import CloudStoreError, supabase_is_configured
 from .engine import GeminiUnavailableError, answer_question
 from .models import AskRequest, ProfileSettingsUpdate, ProfileUpdate, StudentProfileResponse
 from .official_index import OfficialIndexUnavailableError, list_official_documents
-from .policies import list_documents, save_upload
+from .policies import MAX_UPLOAD_BYTES, list_documents, save_upload
 from .profiles import get_profile, save_profile, save_theme
 from .revocations import revoke_token
 
 app = FastAPI(title="CampusAnswer API", version="1.0.0")
+logger = logging.getLogger(__name__)
+
+
+@app.exception_handler(CloudStoreError)
+async def cloud_store_error_handler(request: Request, error: CloudStoreError) -> JSONResponse:
+    logger.error("Persistent cloud storage request failed: %s", error)
+    return JSONResponse(status_code=503, content={"detail": str(error)})
 
 
 DEFAULT_CORS_ORIGINS = [
@@ -44,7 +56,8 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok"}
+    cloud_storage = supabase_is_configured()
+    return {"status": "ok", "persistence": "supabase" if cloud_storage else "local"}
 
 
 @app.get("/api/auth/me")
@@ -106,6 +119,8 @@ def ask(request: AskRequest, user: AuthenticatedUser = Depends(require_user)) ->
         raise HTTPException(status_code=503, detail=str(error)) from error
     except GeminiUnavailableError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+    except CloudStoreError:
+        raise
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
@@ -113,7 +128,8 @@ def ask(request: AskRequest, user: AuthenticatedUser = Depends(require_user)) ->
 @app.post("/api/documents/upload")
 async def upload(file: UploadFile = File(...), user: AuthenticatedUser = Depends(require_admin)) -> dict:
     try:
-        document = save_upload(file.filename or "", await file.read())
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+        document = await run_in_threadpool(save_upload, file.filename or "", content)
     except (ValueError, OSError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return document.model_dump()

@@ -108,7 +108,7 @@ The Gemini policy workflow passes the retrieved document excerpts, question, rel
 ## Documents
 
 - The sample documents are plain text and intentionally labeled fictional in the library.
-- Allowlisted administrators can upload TXT or text-based PDF files; local files are stored under `backend/documents/` (ignored by Git) and displayed as **LOCAL UPLOAD**. Set `CAMPUSANSWER_DOCUMENTS_DIR` to a persistent directory when deploying.
+- Allowlisted administrators can upload TXT or text-based PDF files; local files are stored under `backend/documents/` (ignored by Git) and displayed as **LOCAL UPLOAD**. Production uploads use the private Supabase bucket described below.
 - For a TXT document, format sections as:
 
   ```text
@@ -118,6 +118,7 @@ The Gemini policy workflow passes the retrieved document excerpts, question, rel
   ```
 
 - Maximum upload size is 5 MB. Reusing an existing filename is rejected rather than overwritten.
+- The free hosted configuration caps uploaded documents at 100 files and 25 MB total to bound memory use; parsed policy text is cached in-process for one minute.
 - Uploads require a verified Firebase account whose email is listed in `FIREBASE_ADMIN_EMAILS`. Only upload documents you are authorized to use.
 - For reproducible tests, the bundled fictional samples include a deliberate contradictory hostel amendment.
 
@@ -178,17 +179,20 @@ Individual contributions are not inferred. Fill the placeholders in `docs/milest
 
 Deployment configuration is included but does not contain credentials:
 
-- `render.yaml` defines a Docker FastAPI service, `/api/health` check, and a 1 GB persistent disk mounted at `/var/data`. It uses Render's paid Starter service plan because the free web service does not provide the persistence required for profiles, revoked sessions, and uploads. Review Render's current billing before creating the service.
-- `Dockerfile` installs Tesseract, downloads/extracts the listed official PDFs, builds the local SQLite RAG index, and starts Uvicorn. Check the Render build log and generated ingestion report for extraction failures or pages still needing OCR.
+- `render.yaml` defines a Docker FastAPI service on Render's **Free** instance type. It deliberately has no Render disk or paid database. Render Free filesystems are ephemeral, so the app requires Supabase configuration before its health check succeeds.
+- Create a Supabase **Free** project and run [`backend/migrations/001_supabase_free_storage.sql`](./backend/migrations/001_supabase_free_storage.sql) in its SQL Editor. This creates private profile/session tables and the private policy-document bucket. Profiles and revoked-session hashes use Supabase PostgREST; uploaded TXT/PDF documents use Supabase Storage. Keep the service-role key server-side only.
+- The official PDFs, extracted chunks, and sparse TF-IDF index are rebuilt into the Docker image by `Dockerfile`; they are not stored on Render's temporary filesystem. Check the Render build log and ingestion report for extraction failures or pages still needing OCR.
 - `frontend/vercel.json` provides SPA fallback rewrites so direct React Router URLs can refresh. In Vercel, import the GitHub repository and set **Root Directory** to `frontend`; use `npm run build` and `dist`.
 
 Configure these values in the providers' environment-variable/secret settings, not in Git or chat:
 
-- **Render:** `FIREBASE_PROJECT_ID`, `GEMINI_API_KEY`, `CAMPUSANSWER_CORS_ORIGINS` set to the exact production Vercel origin (no wildcard), and `FIREBASE_ADMIN_EMAILS`. Render Blueprint prompts for these `sync: false` values. If account-wide Firebase refresh-token revocation is required, add a Firebase service-account JSON as a Render secret file and configure `FIREBASE_SERVICE_ACCOUNT_PATH`; never add it to the repository.
-- **Vercel:** `VITE_API_URL` set to the Render service origin, plus the `VITE_FIREBASE_*` web configuration values from Firebase.
+- **Render:** set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `FIREBASE_PROJECT_ID`, `GEMINI_API_KEY`, `FIREBASE_ADMIN_EMAILS`, and `CAMPUSANSWER_CORS_ORIGINS` to the exact production Vercel origin (no wildcard). Keep `CAMPUSANSWER_REQUIRE_CLOUD_STORAGE=true` and `SUPABASE_STORAGE_BUCKET=campusanswer-documents`. Render Blueprint prompts for values marked `sync: false`.
+- **Vercel:** set `VITE_API_URL` to the Render service origin, plus the `VITE_FIREBASE_*` web configuration values from Firebase.
 - **Firebase:** add the Vercel production domain under Authentication → Authorized domains, enable Google sign-in, and restrict the Web API key to the required Firebase APIs and domains.
 
-The Render disk paths are configured for the SQLite auth/profile database and uploaded documents. Official source PDFs and the index are rebuilt in the container image; uploaded files and user data persist on the disk. Preview Vercel domains are not automatically allowed by production CORS. After provider authentication and configuration, test health, Google sign-in, profile persistence, upload authorization, Gemini, and direct-route refresh on the deployed domains. No live provider deployment is claimed until these checks pass.
+Use only free plans and do not enable paid add-ons or billing. Current free-tier limits include Render's spin-down after 15 minutes idle and 750 instance hours/month, Supabase's 500 MB database and 1 GB Storage quotas, and Supabase project pausing after one week of inactivity. A paused Supabase Free project must be resumed before requests can use it; its data is not kept on Render's ephemeral filesystem. Vercel Hobby and Gemini API quotas also apply. Monitor each provider's current quota pages; exceeding or changing free-tier limits may suspend service or require manual action.
+
+Preview Vercel domains are not automatically allowed by production CORS. After provider setup, test health, Google sign-in, profile persistence, upload authorization, Gemini, RAG citations, and direct-route refresh on the deployed domains. No live provider deployment is claimed until these checks pass.
 
 ## Limitations
 
@@ -197,5 +201,5 @@ The Render disk paths are configured for the SQLite auth/profile database and up
 - Gemini was not configured for the recorded evaluation. Live general-knowledge generation and generated policy responses were therefore not verified in that run.
 - Contradiction detection is deliberately narrow (same section title with differing text); it is not a comprehensive policy conflict resolver.
 - Quotation and answer checks are conservative and may decline a valid paraphrase.
-- Uploads require a verified account on the server-side administrator allowlist and are stored locally unless a persistent `CAMPUSANSWER_DOCUMENTS_DIR` is configured; this prototype is not suitable for sensitive documents or public deployment without further storage protections, audit logging, and policy validation.
+- Uploads require a verified account on the server-side administrator allowlist. Production uploads use a private Supabase Storage bucket; local development can use `CAMPUSANSWER_DOCUMENTS_DIR`. This prototype is not suitable for sensitive documents without further storage protections, audit logging, and policy validation.
 - Evaluation results are specific to their recorded run and mode. Deterministic demo outcomes are not Gemini model quality measurements.

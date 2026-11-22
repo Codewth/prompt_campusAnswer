@@ -2,22 +2,20 @@ services:
   - type: web
     name: campusanswer-api
     runtime: docker
-    plan: starter
+    plan: free
     region: oregon
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /api/health
-    disk:
-      name: campusanswer-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
-      - key: CAMPUSANSWER_AUTH_DATABASE
-        value: /var/data/auth-sessions.sqlite
-      - key: CAMPUSANSWER_PROFILE_DATABASE
-        value: /var/data/auth-sessions.sqlite
-      - key: CAMPUSANSWER_DOCUMENTS_DIR
-        value: /var/data/documents
+      - key: CAMPUSANSWER_REQUIRE_CLOUD_STORAGE
+        value: "true"
+      - key: SUPABASE_STORAGE_BUCKET
+        value: campusanswer-documents
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
       - key: FIREBASE_PROJECT_ID
         sync: false
       - key: FIREBASE_ADMIN_EMAILS

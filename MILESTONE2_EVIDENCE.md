@@ -65,7 +65,8 @@ Browser checks were performed against the running local app at `http://localhost
 - Official-source ingestion contains dated documents and OCR artifacts. Source dates do not prove a rule is current; the attendance documents currently conflict. Review extracted text against original PDFs and have an authorized university source owner confirm policy currency before relying on or publishing answers.
 - Retrieval is local sparse lexical retrieval, not a production semantic/vector service. Conflict detection is limited and can miss conflicts outside implemented checks. Citation verification is deliberately strict and can reject paraphrases.
 - Backend auth tests stub Firebase token verification; live login was present in the browser, but fresh registration, logout/revocation, and administrator upload were not tested in this run.
-- Local SQLite, local file upload, and current CORS/configuration are development choices. Production needs secure secret injection, HTTPS, explicit production origins, shared durable storage, upload controls/scanning, rate limits, monitoring, backups, and source-update ownership.
+- Local development uses SQLite and local file uploads. Free production configuration now uses Supabase for profile/session persistence and private uploaded-document storage; Render is configured for its Free instance without a disk. These cloud paths are covered by mocked regression tests but still require a configured Supabase project and live verification.
+- Production still needs provider-managed secrets, explicit CORS/Firebase domains, upload controls/scanning, rate limits, monitoring, backups, and a source-update owner.
 - No production deployment was run.
 
 ## Commands to reproduce locally

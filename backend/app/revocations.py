@@ -1,7 +1,10 @@
 import hashlib
 import os
 import sqlite3
+import time
 from pathlib import Path
+
+from .cloud_store import supabase_is_configured, table_request
 
 
 DEFAULT_DATABASE = Path(__file__).resolve().parents[1] / "auth-sessions.sqlite"
@@ -23,6 +26,21 @@ def _connect() -> sqlite3.Connection:
 
 def revoke_token(token: str, user_id: str, expires_at: int) -> None:
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    if supabase_is_configured():
+        table_request(
+            "DELETE",
+            "revoked_tokens",
+            params={"expires_at": f"lte.{int(time.time())}"},
+            headers={"Prefer": "return=minimal"},
+        )
+        table_request(
+            "POST",
+            "revoked_tokens",
+            params={"on_conflict": "token_hash"},
+            json_body={"token_hash": token_hash, "user_id": user_id, "expires_at": expires_at},
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+        return
     with _connect() as connection:
         connection.execute("DELETE FROM revoked_tokens WHERE expires_at <= unixepoch()")
         connection.execute(
@@ -33,6 +51,19 @@ def revoke_token(token: str, user_id: str, expires_at: int) -> None:
 
 def is_token_revoked(token: str) -> bool:
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    if supabase_is_configured():
+        rows = table_request(
+            "GET",
+            "revoked_tokens",
+            params={
+                "select": "token_hash",
+                "token_hash": f"eq.{token_hash}",
+                "expires_at": f"gt.{int(time.time())}",
+            },
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError("Supabase returned an invalid revoked-token response.")
+        return bool(rows)
     with _connect() as connection:
         connection.execute("DELETE FROM revoked_tokens WHERE expires_at <= unixepoch()")
         return connection.execute(

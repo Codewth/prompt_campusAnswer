@@ -27,3 +27,10 @@ CampusAnswer_Official_Sources/vector-index.sqlite3*
 *.key
 *.p12
 *.pfx
+service-account*.json
+firebase-adminsdk*.json
+*service-account*.json
+credentials.json
+secrets
+*.secret
+*.secrets
