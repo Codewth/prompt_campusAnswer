@@ -108,7 +108,7 @@ The Gemini policy workflow passes the retrieved document excerpts, question, rel
 ## Documents
 
 - The sample documents are plain text and intentionally labeled fictional in the library.
-- Upload TXT or text-based PDF files through the local demo interface; files are stored under `backend/documents/` (ignored by Git) and displayed as **LOCAL UPLOAD**.
+- Allowlisted administrators can upload TXT or text-based PDF files; local files are stored under `backend/documents/` (ignored by Git) and displayed as **LOCAL UPLOAD**. Set `CAMPUSANSWER_DOCUMENTS_DIR` to a persistent directory when deploying.
 - For a TXT document, format sections as:
 
   ```text
@@ -118,7 +118,7 @@ The Gemini policy workflow passes the retrieved document excerpts, question, rel
   ```
 
 - Maximum upload size is 5 MB. Reusing an existing filename is rejected rather than overwritten.
-- This is a local demonstration uploader, not an authenticated production administrator workflow. Only upload documents you are authorized to use.
+- Uploads require a verified Firebase account whose email is listed in `FIREBASE_ADMIN_EMAILS`. Only upload documents you are authorized to use.
 - For reproducible tests, the bundled fictional samples include a deliberate contradictory hostel amendment.
 
 ## Official Bennett sources
