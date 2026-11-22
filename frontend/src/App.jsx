@@ -9,7 +9,7 @@ import {
 import { LOGOUT_WARNING_KEY, RETURN_TO_KEY, safeReturnPath, useAuth } from "./AuthContext.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
-const CHAT_REQUEST_TIMEOUT_MS = 90_000;
+const CHAT_REQUEST_TIMEOUT_MS = 120_000;
 const links = [
   { id: "dashboard", label: "Overview", icon: Home },
   { id: "chat", label: "Ask CampusAnswer", icon: MessageCircle },
@@ -552,7 +552,7 @@ function Chat({ history, setHistory, navigate, authorizedFetch }) {
       setHistory((items) => items.map((item) => item.id === id ? { ...item, pending: false } : item));
       setRetryRequest({ id, question: text });
       setError(requestError.name === "AbortError"
-        ? "CampusAnswer did not respond within 90 seconds. The free service may be waking up; please retry."
+        ? "CampusAnswer did not respond within 120 seconds. The free service may be waking up; please retry."
         : requestError instanceof TypeError
           ? "Could not reach CampusAnswer. Check your connection and try again."
           : requestError.message || "The assistant could not answer right now.");

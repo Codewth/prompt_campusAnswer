@@ -70,7 +70,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 logger = logging.getLogger(__name__)
 GEMINI_MODEL_DEFAULT = "gemini-3.8-flash"
 GEMINI_CONNECT_TIMEOUT_SECONDS = 5
-GEMINI_READ_TIMEOUT_SECONDS = 25
+GEMINI_READ_TIMEOUT_SECONDS = 45
 MAX_POLICY_EVIDENCE_CHUNKS = 5
 MAX_POLICY_EVIDENCE_CHARS = 12_000
 MAX_HISTORY_MESSAGES = 8
@@ -510,7 +510,11 @@ def _gemini_json_response(system_prompt: str, contents: list[dict], schema: dict
     request_body = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
-        "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "thinkingConfig": {"thinkingLevel": "low"},
+        },
     }
     started = time.perf_counter()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"

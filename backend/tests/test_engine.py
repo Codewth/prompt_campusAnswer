@@ -100,6 +100,7 @@ def test_general_answer_uses_gemini_and_has_no_policy_citations(monkeypatch):
     assert requests[0][1]["headers"]["x-goog-api-key"] == "test-key-not-real"
     assert "test-key-not-real" not in requests[0][0]
     assert requests[0][0].endswith("/models/gemini-3.8-flash:generateContent")
+    assert requests[0][1]["json"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
 
 
 @pytest.mark.parametrize(
